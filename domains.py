@@ -381,6 +381,118 @@ def _profile_sync(ctx: SyncContext) -> dict[str, int]:
     return {"user_profile": 1, "goals": goals_total}
 
 
+# ------------------------------------------------------------------ workouts
+# Read-only. The write side (upload/schedule) lives in garmin_write.py and
+# must never be imported from here — tests/test_write_isolation.py enforces it.
+
+SCHEDULE_LOOKAHEAD_DAYS = 62
+SCHEDULE_FETCH_SLEEP_S = 1.0
+WORKOUT_PAGE_SIZE = 100
+
+
+def parse_scheduled(calendar: dict | None) -> list[dict]:
+    """Workout items from a get_scheduled_workouts() calendar payload. The
+    payload also carries weigh-ins, activities, naps, etc., and spans the
+    whole calendar grid (neighbouring-month days included)."""
+    return [
+        i for i in (calendar or {}).get("calendarItems", [])
+        if i.get("itemType") == "workout" and i.get("workoutId")
+    ]
+
+
+def month_window(start: date, end: date) -> tuple[date, date]:
+    first = start.replace(day=1)
+    last = (end.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    return first, last
+
+
+def _fetch_scheduled(client, start: date, end: date) -> dict[int, dict]:
+    """Calendar item id -> workout item, for every month from start's to
+    end's. get_scheduled_workouts takes a 1-based month (the library
+    converts). Adjacent months overlap in the grid, hence the id dedupe."""
+    items: dict[int, dict] = {}
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        for item in parse_scheduled(client.get_scheduled_workouts(year, month)):
+            items[int(item["id"])] = item
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+        time.sleep(SCHEDULE_FETCH_SLEEP_S)
+    return items
+
+
+def _fetch_workout_list(client) -> list[dict]:
+    out: list[dict] = []
+    start = 0
+    while True:
+        page = client.get_workouts(start, WORKOUT_PAGE_SIZE) or []
+        out.extend(page)
+        if len(page) < WORKOUT_PAGE_SIZE:
+            return out
+        start += WORKOUT_PAGE_SIZE
+        time.sleep(1)
+
+
+def _upsert_workout(conn: psycopg.Connection, workout: dict, change_marker: str | None) -> None:
+    conn.execute(
+        """
+        insert into workouts (workout_id, workout_name, updated_date, raw, synced_at)
+        values (%s, %s, %s, %s, now())
+            on conflict (workout_id) do update set
+            workout_name = excluded.workout_name, updated_date = excluded.updated_date,
+            raw = excluded.raw, synced_at = now()
+        """,
+        (workout["workoutId"], workout.get("workoutName"), change_marker, json.dumps(workout)),
+    )
+
+
+def _replace_scheduled(conn: psycopg.Connection, items: dict[int, dict], window: tuple[date, date]) -> None:
+    # Rows in the fetched window that Garmin no longer returns were
+    # unscheduled (in Connect, or by the enactor) — drop them.
+    conn.execute(
+        "delete from scheduled_workouts where scheduled_date between %s and %s and not (schedule_id = any(%s::bigint[]))",
+        (window[0], window[1], list(items)),
+    )
+    for schedule_id, item in items.items():
+        conn.execute(
+            """
+            insert into scheduled_workouts (schedule_id, workout_id, scheduled_date, raw, synced_at)
+            values (%s, %s, %s, %s, now())
+                on conflict (schedule_id) do update set
+                workout_id = excluded.workout_id, scheduled_date = excluded.scheduled_date,
+                raw = excluded.raw, synced_at = now()
+            """,
+            (schedule_id, item["workoutId"], item["date"], json.dumps(item)),
+        )
+
+
+def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
+    listing = _fetch_workout_list(ctx.client)
+    stored = dict(ctx.conn.execute("select workout_id, updated_date from workouts").fetchall())
+    for summary in listing:
+        workout_id = int(summary["workoutId"])
+        # The list calls its change marker `updateDate`; the detail payload
+        # calls it `updatedDate`. Compare and store the list's.
+        marker = summary.get("updateDate")
+        if workout_id in stored and stored[workout_id] == marker:
+            continue
+        _upsert_workout(ctx.conn, ctx.client.get_workout_by_id(workout_id), marker)
+        time.sleep(1)
+    # An empty listing is far more likely an API hiccup than a user who
+    # deleted every workout — never wipe the table on it.
+    if listing:
+        ctx.conn.execute(
+            "delete from workouts where not (workout_id = any(%s::bigint[]))",
+            ([int(w["workoutId"]) for w in listing],),
+        )
+    ctx.conn.commit()
+
+    end = ctx.today + timedelta(days=SCHEDULE_LOOKAHEAD_DAYS)
+    scheduled = _fetch_scheduled(ctx.client, ctx.today, end)
+    _replace_scheduled(ctx.conn, scheduled, month_window(ctx.today, end))
+    ctx.conn.commit()
+    return {"workouts": len(listing), "scheduled_workouts": len(scheduled)}
+
+
 # --------------------------------------------------------------------- registry
 
 DOMAINS: list[Domain] = [
@@ -419,6 +531,12 @@ DOMAINS: list[Domain] = [
         description="Account profile/settings and goals (active/future/past).",
         default_enabled=True, sync_incremental=_profile_sync, backfill=None,
         tables=("user_profile", "goals"),
+    ),
+    Domain(
+        key="workouts", category="Workouts", label="Workout library & calendar",
+        description="Your workout library (fully expanded steps + description) and workouts scheduled on your Garmin calendar. Read-only.",
+        default_enabled=False, sync_incremental=_workouts_sync, backfill=None,
+        tables=("workouts", "scheduled_workouts"),
     ),
     # "reproductive" (menstrual calendar, pregnancy summary) is deliberately
     # not registered here yet — its endpoints haven't been verified live.

@@ -3,6 +3,7 @@
 # dependencies = [
 #     "garminconnect>=0.3.6",
 #     "psycopg[binary]>=3.3",
+#     "python-dotenv>=1.0",
 # ]
 # ///
 """
@@ -32,6 +33,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from apply_schema import apply_migrations, applied_versions
 from config import get_enabled_domains, set_enabled_domains
+import domains
 from domains import DOMAINS, SyncContext
 
 DB_URL = os.environ["SMOKE_TEST_DATABASE_URL"]
@@ -170,12 +172,60 @@ def test_targeted_backfill_trigger_stub() -> None:
     print("test_targeted_backfill_trigger_stub: PASS")
 
 
+class _WorkoutsStub:
+    def __init__(self, listing):
+        self.listing = listing
+
+    def get_workouts(self, start, limit):
+        return self.listing[start:start + limit]
+
+    def get_workout_by_id(self, workout_id):
+        return {"workoutId": workout_id, "workoutName": f"w{workout_id}", "updatedDate": "u1", "description": "desc"}
+
+    def get_scheduled_workouts(self, year, month):
+        return {"calendarItems": []}
+
+
+def test_workouts_domain_tables_and_join() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    domains.SCHEDULE_FETCH_SLEEP_S = 0
+    with psycopg.connect(DB_URL) as conn:
+        for t in ("workouts", "scheduled_workouts"):
+            assert _table_exists(conn, t), f"{t} missing after enabling workouts"
+        ctx = SyncContext(client=_WorkoutsStub([{"workoutId": 42, "updateDate": "u1"}]), conn=conn,
+                          window_start=date.today(), today=date.today())
+        domains._workouts_sync(ctx)
+        conn.execute("""insert into activities (activity_id, raw) values (1, '{"workoutId": 42}'::jsonb)""")
+        desc = conn.execute(
+            "select w.raw->>'description' from activities a join workouts w on w.workout_id = (a.raw->>'workoutId')::bigint"
+        ).fetchone()[0]
+        assert desc == "desc"
+
+    # disabling the domain leaves the tables in place
+    apply_migrations(DB_URL, enabled_domains={"activities"})
+    with psycopg.connect(DB_URL) as conn:
+        assert _table_exists(conn, "workouts")
+    print("test_workouts_domain_tables_and_join: PASS")
+
+
+def test_workouts_sync_keeps_rows_on_empty_listing() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        ctx = SyncContext(client=_WorkoutsStub([]), conn=conn, window_start=date.today(), today=date.today())
+        domains._workouts_sync(ctx)
+        assert conn.execute("select count(*) from workouts").fetchone()[0] == 1
+    print("test_workouts_sync_keeps_rows_on_empty_listing: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
     test_upgrade_adds_domain()
     test_idempotent_reapply()
     test_disabled_domain_not_pulled()
+    test_workouts_domain_tables_and_join()
+    test_workouts_sync_keeps_rows_on_empty_listing()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
