@@ -22,6 +22,7 @@ be exercised until the challenges-in-progress probe's follow-up plan adds
 real migrations — see that plan's "Out of scope" section; not covered
 here on purpose.
 """
+import contextlib
 import os
 import pathlib
 import sys
@@ -35,6 +36,7 @@ from apply_schema import apply_migrations, applied_versions
 from config import get_enabled_domains, set_enabled_domains
 import domains
 import planning
+import seed_workouts
 from domains import DOMAINS, SyncContext
 import garmin_write
 from coach_roles import CoachLoopRoles, apply_coach_grants, assert_role_isolated, ensure_role, url_for_role
@@ -323,6 +325,97 @@ def test_plan_admin_approve_unapprove() -> None:
     print("test_plan_admin_approve_unapprove: PASS")
 
 
+class FakeGarmin:
+    """In-memory stand-in for the Garmin write + calendar endpoints."""
+
+    def __init__(self):
+        self.next_id = 1000
+        self.library: dict[int, dict] = {}
+        self.calendar: dict[int, dict] = {}
+        self.uploads: list[int] = []
+        self.schedules: list[tuple[int, str]] = []
+        self.unschedules: list[int] = []
+        self.deletes: list[int] = []
+
+    def _id(self) -> int:
+        self.next_id += 1
+        return self.next_id
+
+    def upload_workout(self, payload):
+        wid = self._id()
+        self.library[wid] = payload
+        self.uploads.append(wid)
+        return {"workoutId": wid, "workoutName": payload["workoutName"]}
+
+    def schedule_workout(self, workout_id, date_str):
+        sid = self._id()
+        self.calendar[sid] = {"id": sid, "itemType": "workout", "workoutId": int(workout_id), "date": date_str}
+        self.schedules.append((int(workout_id), date_str))
+        return {"workoutScheduleId": sid}
+
+    def unschedule_workout(self, schedule_id):
+        self.calendar.pop(int(schedule_id))
+        self.unschedules.append(int(schedule_id))
+
+    def delete_workout(self, workout_id):
+        self.library.pop(int(workout_id), None)
+        self.deletes.append(int(workout_id))
+
+    def get_scheduled_workouts(self, year, month):
+        return {"calendarItems": [
+            i for i in self.calendar.values()
+            if (date.fromisoformat(i["date"]).year, date.fromisoformat(i["date"]).month) == (year, month)
+        ]}
+
+
+def _yes(_summary: str) -> bool:
+    return True
+
+
+def test_seed_only_approved_and_rehash() -> None:
+    import plan_admin
+    coach_url, sched_url = _setup_coach_loop()
+    seed_workouts.POLITENESS_SLEEP_S = 0
+    tomorrow = date.today() + timedelta(days=1)
+    fake = FakeGarmin()
+    with psycopg.connect(coach_url) as conn:
+        pid = conn.execute(
+            "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'finger-repeaters-7-3') returning id",
+            (tomorrow,),
+        ).fetchone()[0]
+
+    def seed():
+        with psycopg.connect(sched_url) as conn:
+            return seed_workouts.run(conn, lambda: contextlib.nullcontext(fake), today=date.today(), confirm=_yes, prune_stale=True)
+
+    assert seed() == 0 and fake.uploads == [], "unapproved plan row must not be seeded"
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [pid], None)
+    seed()
+    assert len(fake.uploads) == 1
+    seed()
+    assert len(fake.uploads) == 1, "unchanged params must not re-upload"
+
+    # coach changes params -> approval goes stale -> nothing uploaded until re-approved
+    with psycopg.connect(coach_url) as conn:
+        conn.execute("update protocols set params = params || '{\"reps\": 7}'::jsonb where slug = 'finger-repeaters-7-3'")
+    seed()
+    assert len(fake.uploads) == 1, "stale approval must block the re-upload"
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [pid], None)
+    seed()
+    assert len(fake.uploads) == 2 and fake.deletes == [fake.uploads[0]], "re-upload + prune of unreferenced stale workout"
+    with psycopg.connect(DB_URL) as conn:
+        assert conn.execute("select workout_id from generated_workouts where protocol_slug = 'finger-repeaters-7-3'").fetchone()[0] == fake.uploads[1]
+
+    # a post-approval rename would change what's uploaded -> stale, nothing uploaded
+    with psycopg.connect(coach_url) as conn:
+        conn.execute("update protocols set name = 'Renamed' where slug = 'finger-repeaters-7-3'")
+    seed()
+    assert len(fake.uploads) == 2, "a post-approval rename must not be uploaded unapproved"
+    print("test_seed_only_approved_and_rehash: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -334,6 +427,7 @@ def main() -> None:
     test_coach_role_isolation()
     test_scheduler_token_save()
     test_plan_admin_approve_unapprove()
+    test_seed_only_approved_and_rehash()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
