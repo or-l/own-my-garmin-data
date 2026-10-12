@@ -192,7 +192,7 @@ def test_workouts_domain_tables_and_join() -> None:
     apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
     domains.SCHEDULE_FETCH_SLEEP_S = 0
     with psycopg.connect(DB_URL) as conn:
-        for t in ("workouts", "scheduled_workouts"):
+        for t in ("workouts", "scheduled_workouts", "training_plan", "protocols", "generated_workouts", "plan_approvals"):
             assert _table_exists(conn, t), f"{t} missing after enabling workouts"
         ctx = SyncContext(client=_WorkoutsStub([{"workoutId": 42, "updateDate": "u1"}]), conn=conn,
                           window_start=date.today(), today=date.today())
@@ -206,7 +206,7 @@ def test_workouts_domain_tables_and_join() -> None:
     # disabling the domain leaves the tables in place
     apply_migrations(DB_URL, enabled_domains={"activities"})
     with psycopg.connect(DB_URL) as conn:
-        assert _table_exists(conn, "workouts")
+        assert _table_exists(conn, "workouts") and _table_exists(conn, "training_plan")
     print("test_workouts_domain_tables_and_join: PASS")
 
 
