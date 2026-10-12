@@ -505,6 +505,20 @@ def test_enactor_round_trip() -> None:
     print("test_enactor_round_trip: PASS")
 
 
+def test_read_only_install_has_no_coach_config() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    default_keys = {d.key for d in DOMAINS if d.default_enabled}
+    apply_migrations(DB_URL, enabled_domains=default_keys)
+    from config import get_coach_loop
+    with psycopg.connect(DB_URL) as conn:
+        set_enabled_domains(conn, default_keys)
+        assert get_coach_loop(conn) is None
+        assert "workouts" not in get_enabled_domains(conn)
+        assert not _table_exists(conn, "training_plan")
+    print("test_read_only_install_has_no_coach_config: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -518,6 +532,7 @@ def main() -> None:
     test_plan_admin_approve_unapprove()
     test_seed_only_approved_and_rehash()
     test_enactor_round_trip()
+    test_read_only_install_has_no_coach_config()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
