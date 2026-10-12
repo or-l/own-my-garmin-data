@@ -1,0 +1,45 @@
+name: garmin-enact
+
+# MANUAL ONLY — never add a timed trigger. This is the one workflow that
+# writes to Garmin (uploads generated workouts, schedules approved plan rows).
+# It needs the SCHEDULER_DATABASE_URL secret, which is a standing
+# Garmin-write-capable credential in CI; running `uv run seed_workouts.py`
+# and `uv run sync_schedule.py --confirm` locally keeps it off shared infra.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Write to Garmin. Unchecked = dry run (prints what would be uploaded/scheduled)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garmin-enact
+  cancel-in-progress: false
+
+jobs:
+  enact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SCHEDULER_DATABASE_URL: ${{ secrets.SCHEDULER_DATABASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r ingestion/requirements.txt
+
+      - name: Seed generated workouts
+        run: python seed_workouts.py ${{ inputs.confirm && '--confirm' || '' }}
+
+      - name: Schedule approved plan rows
+        run: python sync_schedule.py ${{ inputs.confirm && '--confirm' || '' }}
