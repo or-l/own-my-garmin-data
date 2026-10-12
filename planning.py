@@ -102,8 +102,10 @@ select tp.id, tp.scheduled_date, tp.source, tp.protocol_slug, tp.workout_id, tp.
 def load_plan(conn: psycopg.Connection, *, since: date | None = None, ids: list[int] | None = None) -> list[PlanView]:
     where, args = [], []
     if since is not None:
-        where.append("tp.scheduled_date >= %s")
-        args.append(since)
+        # Also rows whose calendar entry is still ahead even though the coach
+        # moved the row into the past, so a later skip can still remove it.
+        where.append("(tp.scheduled_date >= %s or tp.enacted_date >= %s)")
+        args += [since, since]
     if ids is not None:
         where.append("tp.id = any(%s::bigint[])")
         args.append(list(ids))

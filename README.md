@@ -217,7 +217,9 @@ make the coach exceed its grants.
 1. Ingestion syncs your library and calendar (the `workouts` domain).
 2. The coach writes `training_plan` / `protocols` through `run_write_sql`.
 3. You review and approve: `uv run plan_admin.py list`, then
-   `uv run plan_admin.py approve --id N` (or `--date YYYY-MM-DD`).
+   `uv run plan_admin.py approve --id N` (or `--date YYYY-MM-DD`). It shows
+   exactly what it's about to approve and asks you to type `yes` (or pass
+   `--yes`); an edit made after that shows up as STALE.
 4. `uv run seed_workouts.py --confirm` uploads any approved generated workouts.
 5. `uv run sync_schedule.py --confirm` puts approved rows on the calendar —
    or Actions tab → **garmin-enact** → Run workflow with **confirm** checked.

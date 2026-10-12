@@ -16,7 +16,8 @@ rows as real Garmin workouts. Manual only; runs as the scheduler role.
 
 Per slug: not in generated_workouts -> build + upload + insert ledger;
 protocol hash changed -> re-upload + repoint ledger (old workout left alone
-unless --prune-stale and no activity references it); unchanged -> skip.
+unless --prune-stale and nothing references it: no activity, no enacted
+plan row, no synced calendar entry); unchanged -> skip.
 Library workouts are never touched. A row whose approval went stale (edited
 after approval) is skipped until re-approved — see planning.py.
 
@@ -68,12 +69,19 @@ def plan_seed(conn: psycopg.Connection, today: date) -> tuple[list[SeedAction], 
     return actions, notes
 
 
-def _activity_references(conn: psycopg.Connection, workout_id: int) -> bool:
+def _still_referenced(conn: psycopg.Connection, workout_id: int) -> str | None:
+    """Why the old workout must be kept, or None if it's safe to delete:
+    an activity was done from it, a plan row is enacted with it (e.g. a row
+    left stale, still on the calendar), or the synced calendar holds it."""
     if conn.execute("select to_regclass('activities')").fetchone()[0] is None:
-        return True  # can't tell -> treat as referenced, never delete
-    return conn.execute(
-        "select exists (select 1 from activities where raw->>'workoutId' = %s)", (str(workout_id),)
-    ).fetchone()[0]
+        return "can't check activities"  # can't tell -> treat as referenced, never delete
+    if conn.execute("select exists (select 1 from activities where raw->>'workoutId' = %s)", (str(workout_id),)).fetchone()[0]:
+        return "an activity references it"
+    if conn.execute("select exists (select 1 from training_plan where resolved_workout_id = %s)", (workout_id,)).fetchone()[0]:
+        return "a plan row is still scheduled with it"
+    if conn.execute("select exists (select 1 from scheduled_workouts where workout_id = %s)", (workout_id,)).fetchone()[0]:
+        return "it's on the synced Garmin calendar"
+    return None
 
 
 def execute_seed(conn: psycopg.Connection, client, actions: list[SeedAction], *, prune_stale: bool) -> tuple[list[str], int]:
@@ -96,8 +104,9 @@ def execute_seed(conn: psycopg.Connection, client, actions: list[SeedAction], *,
             conn.commit()
             lines.append(f"{a.kind} {a.slug} -> workout {workout_id}")
             if a.kind == "reupload" and prune_stale:
-                if _activity_references(conn, a.old_workout_id):
-                    lines.append(f"  kept old workout {a.old_workout_id} (an activity references it)")
+                why = _still_referenced(conn, a.old_workout_id)
+                if why:
+                    lines.append(f"  kept old workout {a.old_workout_id} ({why})")
                 else:
                     garmin_write.delete(client, a.old_workout_id)
                     lines.append(f"  deleted stale workout {a.old_workout_id}")
@@ -133,7 +142,7 @@ def run(conn: psycopg.Connection, open_client: Callable[[], ContextManager], *, 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--confirm", action="store_true", help="Actually upload (default: dry run).")
-    parser.add_argument("--prune-stale", action="store_true", help="Delete a replaced workout if no activity references it.")
+    parser.add_argument("--prune-stale", action="store_true", help="Delete a replaced workout if nothing references it (activity, enacted plan row, synced calendar).")
     args = parser.parse_args()
     load_dotenv()
     with psycopg.connect(os.environ["SCHEDULER_DATABASE_URL"]) as conn:

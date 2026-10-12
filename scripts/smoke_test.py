@@ -349,6 +349,7 @@ class FakeGarmin:
         self.schedules: list[tuple[int, str]] = []
         self.unschedules: list[int] = []
         self.deletes: list[int] = []
+        self.on_schedule = None  # test hook: runs inside schedule_workout, before it returns
 
     def _id(self) -> int:
         self.next_id += 1
@@ -364,6 +365,8 @@ class FakeGarmin:
         sid = self._id()
         self.calendar[sid] = {"id": sid, "itemType": "workout", "workoutId": int(workout_id), "date": date_str}
         self.schedules.append((int(workout_id), date_str))
+        if self.on_schedule:
+            self.on_schedule()
         return {"workoutScheduleId": sid}
 
     def unschedule_workout(self, schedule_id):
@@ -531,6 +534,80 @@ def test_read_only_install_has_no_coach_config() -> None:
     print("test_read_only_install_has_no_coach_config: PASS")
 
 
+def test_review_fixes() -> None:
+    """Whole-branch review findings I1-I4 (see the plan's ledger)."""
+    import plan_admin
+    coach_url, sched_url = _setup_coach_loop()
+    seed_workouts.POLITENESS_SLEEP_S = 0
+    sync_schedule.POLITENESS_SLEEP_S = 0
+    domains.SCHEDULE_FETCH_SLEEP_S = 0
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    far = (tomorrow.replace(day=1) + timedelta(days=62)).replace(day=1)  # two months on: outside tomorrow's fetch window
+    fake = FakeGarmin()
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("insert into workouts (workout_id, workout_name, raw) values (555, 'Bear Essentials', '{}'::jsonb)")
+
+    def enact():
+        with psycopg.connect(sched_url) as conn:
+            seed_workouts.run(conn, lambda: contextlib.nullcontext(fake), today=today, confirm=_yes, prune_stale=True)
+            sync_schedule.run(conn, lambda: contextlib.nullcontext(fake), today=today, confirm=_yes)
+
+    def coach(sql, *args):
+        with psycopg.connect(coach_url) as conn:
+            row = conn.execute(sql, args).fetchone() if "returning" in sql else conn.execute(sql, args)
+            return row[0] if "returning" in sql else None
+
+    def calendar_pairs():
+        return sorted((i["workoutId"], i["date"]) for i in fake.calendar.values())
+
+    # I3: approval pins what the owner was shown, not what's there at commit time
+    lib = coach("insert into training_plan (scheduled_date, source, workout_id) values (%s, 'library', 555) returning id", far)
+    with psycopg.connect(DB_URL) as conn:
+        shown = plan_admin.preview(conn, [lib])
+    coach("update training_plan set scheduled_date = scheduled_date + 1 where id = %s", lib)
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve_views(conn, shown, None)
+        assert planning.load_plan(conn, ids=[lib])[0].approval == "stale", "edit after preview must not ride on the approval"
+    coach("update training_plan set scheduled_date = %s where id = %s", far, lib)
+
+    # I2b: once scheduling starts the row is pinned, so the coach can't delete it mid-flight
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [lib], None)
+    attempts = []
+    fake.on_schedule = lambda: attempts.append(_denied(coach_url, "delete from training_plan where id = %s", (lib,)))
+    enact()
+    fake.on_schedule = None
+    assert attempts == [True], f"coach delete during schedule must be denied: {attempts}"
+    assert calendar_pairs() == [(555, far.isoformat())]
+
+    # I1: moving an enacted row far -> tomorrow must remove the old (out-of-window) entry
+    coach("update training_plan set scheduled_date = %s where id = %s", tomorrow, lib)
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [lib], None)
+    enact()
+    assert calendar_pairs() == [(555, tomorrow.isoformat())], f"old entry orphaned: {calendar_pairs()}"
+
+    # I2a: an enacted row moved into the past and then skipped must still be cancelled
+    coach("update training_plan set scheduled_date = %s, skip = true where id = %s", today - timedelta(days=3), lib)
+    enact()
+    assert calendar_pairs() == [], f"stranded entry: {calendar_pairs()}"
+
+    # I4: --prune-stale must not delete a generated workout that's still on the calendar
+    gen = coach("insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'finger-repeaters-7-3') returning id", tomorrow)
+    gen2 = coach("insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'finger-repeaters-7-3') returning id", tomorrow + timedelta(days=2))
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [gen, gen2], None)
+    enact()
+    first = fake.uploads[-1]
+    coach("update protocols set params = params || '{\"reps\": 8}'::jsonb where slug = 'finger-repeaters-7-3'")
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [gen], None)  # gen2 left stale, still on the calendar with the old workout
+    enact()
+    assert first not in fake.deletes, "pruned a workout that's still scheduled"
+    print("test_review_fixes: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -544,6 +621,7 @@ def main() -> None:
     test_plan_admin_approve_unapprove()
     test_seed_only_approved_and_rehash()
     test_enactor_round_trip()
+    test_review_fixes()
     test_read_only_install_has_no_coach_config()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")

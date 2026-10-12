@@ -118,17 +118,19 @@ def plan_enact(conn: psycopg.Connection, views: list[planning.PlanView], live_it
         if owner.setdefault(target, row.id) != row.id:
             notes.append(f"plan {row.id} ({v.describe()}): skipped — same workout and day as plan {owner[target]}")
             continue
+        # The entry this row put on the calendar before (if it moved, it's stale).
+        old = None
+        if row.resolved_workout_id is not None and row.enacted_date is not None \
+                and (row.resolved_workout_id, row.enacted_date) != target:
+            old = live.get((row.resolved_workout_id, row.enacted_date))
         if target in live:
-            in_sync = recorded(row, workout_id)
-            if not in_sync:
-                actions.append(EnactAction(row.id, row.scheduled_date, workout_id, "record", live_schedule_id=live[target]))
+            if not recorded(row, workout_id):
+                actions.append(EnactAction(row.id, row.scheduled_date, workout_id, "record",
+                                           old_schedule_id=old, live_schedule_id=live[target]))
             continue
         if row.scheduled_date < today:
             notes.append(f"plan {row.id} ({v.describe()}): in the past — not scheduling")
             continue
-        old = None
-        if row.resolved_workout_id is not None and row.enacted_date is not None:
-            old = live.get((row.resolved_workout_id, row.enacted_date))
         actions.append(EnactAction(row.id, row.scheduled_date, workout_id,
                                    "reschedule" if old else "schedule", old_schedule_id=old))
     return actions, notes
@@ -150,16 +152,29 @@ def execute_enact(conn: psycopg.Connection, client, actions: list[EnactAction]) 
                 conn.commit()
                 lines.append(f"unschedule plan {a.plan_id}: workout {a.workout_id} on {a.day}")
                 continue
-            if a.kind == "reschedule":
+            if a.old_schedule_id is not None:  # reschedule, or a record that replaces an older entry
                 garmin_write.unschedule(client, a.old_schedule_id)
             if a.kind in ("schedule", "reschedule"):
+                # Pin the row before touching Garmin: with resolved_workout_id set,
+                # the delete guard stops the coach deleting it mid-flight, and a
+                # crash leaves a pointer the next run can diff against.
+                pinned = conn.execute(
+                    "update training_plan set schedule_id = null, resolved_workout_id = %s, enacted_date = %s where id = %s",
+                    (a.workout_id, a.day, a.plan_id),
+                ).rowcount
+                conn.commit()
+                if pinned != 1:
+                    lines.append(f"plan {a.plan_id}: row deleted before scheduling — skipped")
+                    continue
                 schedule_id = garmin_write.schedule(client, a.workout_id, a.day)
                 time.sleep(POLITENESS_SLEEP_S)
-            conn.execute(
+            updated = conn.execute(
                 "update training_plan set status = 'scheduled', schedule_id = %s, resolved_workout_id = %s, enacted_date = %s where id = %s",
                 (schedule_id, a.workout_id, a.day, a.plan_id),
-            )
+            ).rowcount
             conn.commit()
+            if updated != 1:
+                raise RuntimeError(f"plan row vanished after Garmin write (schedule {schedule_id}) — remove it in Connect")
             lines.append(f"{a.kind} plan {a.plan_id}: workout {a.workout_id} on {a.day} (schedule {schedule_id})")
         except Exception as e:
             conn.rollback()
@@ -178,7 +193,10 @@ def run(conn: psycopg.Connection, open_client: Callable[[], ContextManager], *, 
             print(f"  note: {n}")
         print("Enactor: no approved or cancelled plan rows from today on.")
         return 0
-    end = max([v.row.scheduled_date for v in ready] + [v.row.enacted_date for v in cancels])
+    # Cover where rows are going AND where they were enacted before, so a moved
+    # row's old entry is visible to unschedule even when it's outside the new window.
+    end = max([v.row.scheduled_date for v in ready] + [v.row.enacted_date for v in cancels]
+              + [v.row.enacted_date for v in ready if v.row.enacted_date is not None])
     with open_client() as client:
         live = _fetch_scheduled(client, today, end)
         actions, notes = plan_enact(conn, views, live, today)
@@ -190,8 +208,7 @@ def run(conn: psycopg.Connection, open_client: Callable[[], ContextManager], *, 
         print("Enactor plan:")
         for a in actions:
             print(f"  {a.kind:10} plan {a.plan_id}: workout {a.workout_id} on {a.day}")
-        garmin_writes = sum(a.kind in ("schedule", "reschedule") or (a.kind == "unschedule" and a.old_schedule_id is not None)
-                            for a in actions)
+        garmin_writes = sum((a.kind in ("schedule", "reschedule")) + (a.old_schedule_id is not None) for a in actions)
         if not confirm(f"{garmin_writes} Garmin calendar write(s), {len(actions) - garmin_writes} DB-only update(s)."):
             return 0
         lines, errors = execute_enact(conn, client, actions)

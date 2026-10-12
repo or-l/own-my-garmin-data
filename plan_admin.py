@@ -11,11 +11,12 @@ gate). Connects with your owner DATABASE_URL; the coach and scheduler roles
 can't write that table.
 
     uv run plan_admin.py list [--all]            # upcoming rows + approval state
-    uv run plan_admin.py approve --id 12 --id 13 [--note "..."]
+    uv run plan_admin.py approve --id 12 --id 13 [--note "..."] [--yes]
     uv run plan_admin.py approve --date 2026-10-02
     uv run plan_admin.py unapprove --id 12       # alias: reject
 
-Approval records a fingerprint of exactly what you saw (planning.py). If
+`approve` shows the rows and asks you to type 'yes' (or pass --yes), then
+records a fingerprint of exactly what it showed you (planning.py). If
 the coach edits the row or its protocol afterwards, `list` shows it as
 STALE and the enactor skips it until you approve again.
 """
@@ -39,14 +40,22 @@ def ids_for_date(conn: psycopg.Connection, day: date) -> list[int]:
     return [r[0] for r in conn.execute("select id from training_plan where scheduled_date = %s order by id", (day,)).fetchall()]
 
 
-def approve(conn: psycopg.Connection, plan_ids: list[int], note: str | None) -> list[str]:
+def preview(conn: psycopg.Connection, plan_ids: list[int]) -> list[planning.PlanView]:
+    """The rows as they are now, in plan_ids order. approve_views() stores
+    these exact fingerprints, so what you were shown is what gets approved."""
     views = {v.row.id: v for v in planning.load_plan(conn, ids=plan_ids)}
     missing = sorted(set(plan_ids) - set(views))
     if missing:
         raise SystemExit(f"No training_plan row(s) with id {missing}")
+    return [views[pid] for pid in plan_ids]
+
+
+def approve_views(conn: psycopg.Connection, views: list[planning.PlanView], note: str | None) -> list[str]:
+    """Approve the previewed rows. If the coach edited one after preview(),
+    its stored fingerprint no longer matches and it shows as STALE."""
     lines = []
-    for pid in plan_ids:
-        v = views[pid]
+    for v in views:
+        pid = v.row.id
         conn.execute(
             """
             insert into plan_approvals (plan_id, fingerprint, note) values (%s, %s, %s)
@@ -58,6 +67,19 @@ def approve(conn: psycopg.Connection, plan_ids: list[int], note: str | None) -> 
         lines.append(f"approved plan {pid}: {v.describe()}")
     conn.commit()
     return lines
+
+
+def approve(conn: psycopg.Connection, plan_ids: list[int], note: str | None) -> list[str]:
+    return approve_views(conn, preview(conn, plan_ids), note)
+
+
+def _confirmed(yes_flag: bool) -> bool:
+    if yes_flag:
+        return True
+    if not sys.stdin.isatty():
+        print("Not approved — re-run with --yes after reviewing the rows above.")
+        return False
+    return input("Type 'yes' to approve exactly these rows: ").strip().lower() == "yes"
 
 
 def unapprove(conn: psycopg.Connection, plan_ids: list[int]) -> int:
@@ -88,6 +110,7 @@ def main() -> None:
         p.add_argument("--date", type=date.fromisoformat)
         if name == "approve":
             p.add_argument("--note")
+            p.add_argument("--yes", action="store_true", help="Skip the typed confirmation (you've reviewed the rows).")
     args = parser.parse_args()
 
     load_dotenv()
@@ -99,7 +122,13 @@ def main() -> None:
         if not ids:
             raise SystemExit("Give --id and/or --date.")
         if args.cmd == "approve":
-            for line in approve(conn, ids, args.note):
+            views = preview(conn, ids)
+            print("About to approve:")
+            for v in views:
+                print(f"  plan {v.row.id} [{v.approval.upper()}]: {v.describe()}")
+            if not _confirmed(args.yes):
+                return
+            for line in approve_views(conn, views, args.note):
                 print(line)
         else:
             print(f"Removed {unapprove(conn, ids)} approval(s).")
