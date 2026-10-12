@@ -37,6 +37,7 @@ from config import get_enabled_domains, set_enabled_domains
 import domains
 import planning
 import seed_workouts
+import sync_schedule
 from domains import DOMAINS, SyncContext
 import garmin_write
 from coach_roles import CoachLoopRoles, apply_coach_grants, assert_role_isolated, ensure_role, url_for_role
@@ -416,6 +417,94 @@ def test_seed_only_approved_and_rehash() -> None:
     print("test_seed_only_approved_and_rehash: PASS")
 
 
+def test_enactor_round_trip() -> None:
+    import plan_admin
+    coach_url, sched_url = _setup_coach_loop()
+    seed_workouts.POLITENESS_SLEEP_S = 0
+    sync_schedule.POLITENESS_SLEEP_S = 0
+    domains.SCHEDULE_FETCH_SLEEP_S = 0
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    fake = FakeGarmin()
+
+    with psycopg.connect(DB_URL) as conn:  # "ingested" library workouts (owner = ingestion)
+        conn.execute("insert into workouts (workout_id, workout_name, raw) values (555, 'Bear Essentials', '{}'::jsonb)")
+        conn.execute("insert into workouts (workout_id, workout_name, raw) values (601, 'Drill Workout', '{}'::jsonb), (602, 'Drill Workout', '{}'::jsonb)")
+    with psycopg.connect(coach_url) as conn:
+        gen_id = conn.execute(
+            "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'finger-repeaters-7-3') returning id",
+            (tomorrow,)).fetchone()[0]
+        lib_id = conn.execute(
+            "insert into training_plan (scheduled_date, source, workout_name) values (%s, 'library', 'Bear Essentials') returning id",
+            (tomorrow,)).fetchone()[0]
+        amb_id = conn.execute(
+            "insert into training_plan (scheduled_date, source, workout_name) values (%s, 'library', 'Drill Workout') returning id",
+            (tomorrow,)).fetchone()[0]
+        # Same workout and day as lib_id, but keyed by id: passes the unique index.
+        dup_id = conn.execute(
+            "insert into training_plan (scheduled_date, source, workout_id) values (%s, 'library', 555) returning id",
+            (tomorrow,)).fetchone()[0]
+
+    def enact():
+        with psycopg.connect(sched_url) as conn:
+            seed_workouts.run(conn, lambda: contextlib.nullcontext(fake), today=today, confirm=_yes)
+            sync_schedule.run(conn, lambda: contextlib.nullcontext(fake), today=today, confirm=_yes)
+
+    enact()
+    assert fake.uploads == [] and fake.schedules == [], "unapproved rows must never be scheduled"
+
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [gen_id, lib_id, amb_id, dup_id], None)
+    enact()
+    assert len(fake.uploads) == 1, "library rows must not be seeded"
+    assert sorted(fake.schedules) == sorted([(fake.uploads[0], tomorrow.isoformat()), (555, tomorrow.isoformat())]), \
+        f"ambiguous name skipped, duplicate target scheduled once: {fake.schedules}"
+
+    enact()
+    assert len(fake.uploads) == 1 and len(fake.schedules) == 2, "re-run must schedule nothing"
+    with psycopg.connect(DB_URL) as conn:
+        dup_status = conn.execute("select status, schedule_id from training_plan where id = %s", (dup_id,)).fetchone()
+    assert dup_status == ("planned", None), f"duplicate row must not record lib_id's entry: {dup_status}"
+    with psycopg.connect(coach_url) as conn:  # never enacted -> the coach may delete it
+        conn.execute("delete from training_plan where id = %s", (dup_id,))
+
+    # crash-after-schedule simulation: DB forgot, Garmin remembers -> record, don't duplicate
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("update training_plan set status = 'planned', schedule_id = null, resolved_workout_id = null, enacted_date = null where id = %s", (lib_id,))
+    enact()
+    assert len(fake.schedules) == 2
+    with psycopg.connect(DB_URL) as conn:
+        assert conn.execute("select status from training_plan where id = %s", (lib_id,)).fetchone()[0] == "scheduled"
+
+    # coach tampers with an approved row -> stale -> nothing new scheduled
+    with psycopg.connect(coach_url) as conn:
+        conn.execute("update training_plan set scheduled_date = scheduled_date + 1 where id = %s", (lib_id,))
+    enact()
+    assert len(fake.schedules) == 2, "edited-after-approval row must not be enacted"
+
+    # owner re-approves -> moves: old calendar entry unscheduled, new date scheduled
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, [lib_id], None)
+    enact()
+    assert len(fake.schedules) == 3 and len(fake.unschedules) == 1
+    assert (555, (tomorrow + timedelta(days=1)).isoformat()) in fake.schedules
+
+    # coach cancels the enacted generated row: can't delete it, skip removes it from Garmin
+    assert _denied(coach_url, "delete from training_plan where id = %s", (gen_id,))
+    with psycopg.connect(coach_url) as conn:
+        conn.execute("update training_plan set skip = true where id = %s", (gen_id,))
+    enact()
+    assert len(fake.unschedules) == 2 and len(fake.schedules) == 3
+    with psycopg.connect(DB_URL) as conn:
+        assert conn.execute("select status, schedule_id, resolved_workout_id from training_plan where id = %s",
+                            (gen_id,)).fetchone() == ("skipped", None, None)
+    enact()
+    assert len(fake.unschedules) == 2, "re-run must not unschedule again"
+    with psycopg.connect(coach_url) as conn:  # cleared -> deletable now
+        conn.execute("delete from training_plan where id = %s", (gen_id,))
+    print("test_enactor_round_trip: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -428,6 +517,7 @@ def main() -> None:
     test_scheduler_token_save()
     test_plan_admin_approve_unapprove()
     test_seed_only_approved_and_rehash()
+    test_enactor_round_trip()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
