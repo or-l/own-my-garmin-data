@@ -34,6 +34,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from apply_schema import apply_migrations, applied_versions
 from config import get_enabled_domains, set_enabled_domains
 import domains
+import planning
 from domains import DOMAINS, SyncContext
 import garmin_write
 from coach_roles import CoachLoopRoles, apply_coach_grants, assert_role_isolated, ensure_role, url_for_role
@@ -301,6 +302,27 @@ def test_scheduler_token_save() -> None:
     print("test_scheduler_token_save: PASS")
 
 
+def test_plan_admin_approve_unapprove() -> None:
+    import plan_admin
+    coach_url, _sched_url = _setup_coach_loop()
+    tomorrow = date.today() + timedelta(days=1)
+    with psycopg.connect(coach_url) as conn:
+        pid = conn.execute(
+            "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'finger-repeaters-7-3') returning id",
+            (tomorrow,)).fetchone()[0]
+    with psycopg.connect(DB_URL) as conn:
+        lines = plan_admin.approve(conn, [pid], "ok")
+        assert "Finger repeaters 7/3" in lines[0] and '"reps": 6' in lines[0], lines  # owner sees params
+        assert planning.load_plan(conn, ids=[pid])[0].approval == "approved"
+    with psycopg.connect(coach_url) as conn:
+        conn.execute("update protocols set description = 'harder' where slug = 'finger-repeaters-7-3'")
+    with psycopg.connect(DB_URL) as conn:
+        assert planning.load_plan(conn, ids=[pid])[0].approval == "stale"
+        assert plan_admin.unapprove(conn, [pid]) == 1
+        assert planning.load_plan(conn, ids=[pid])[0].approval == "unapproved"
+    print("test_plan_admin_approve_unapprove: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -311,6 +333,7 @@ def main() -> None:
     test_workouts_sync_keeps_rows_on_empty_listing()
     test_coach_role_isolation()
     test_scheduler_token_save()
+    test_plan_admin_approve_unapprove()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
