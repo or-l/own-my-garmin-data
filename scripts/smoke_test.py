@@ -35,6 +35,9 @@ from apply_schema import apply_migrations, applied_versions
 from config import get_enabled_domains, set_enabled_domains
 import domains
 from domains import DOMAINS, SyncContext
+import garmin_write
+from coach_roles import CoachLoopRoles, apply_coach_grants, assert_role_isolated, ensure_role, url_for_role
+from protocols import seed_default_protocols
 
 DB_URL = os.environ["SMOKE_TEST_DATABASE_URL"]
 OLD_INIT_SQL = pathlib.Path(__file__).resolve().parent.parent / "schema" / "init.sql"
@@ -218,6 +221,86 @@ def test_workouts_sync_keeps_rows_on_empty_listing() -> None:
     print("test_workouts_sync_keeps_rows_on_empty_listing: PASS")
 
 
+SMOKE_ROLES = CoachLoopRoles(coach="smoke_coach", scheduler="smoke_scheduler")
+SMOKE_PASSWORDS = {"smoke_coach": "smoke-coach-pw", "smoke_scheduler": "smoke-scheduler-pw"}
+
+
+def _setup_coach_loop() -> tuple[str, str]:
+    """Fresh schema + workouts domain + smoke roles/grants. Returns (coach_url, scheduler_url).
+    Roles are cluster-wide and survive _reset_db, so ensure_role must be idempotent."""
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    enabled = {"activities", "workouts"}
+    apply_migrations(DB_URL, enabled_domains=enabled)
+    with psycopg.connect(DB_URL) as conn:
+        set_enabled_domains(conn, enabled)
+        conn.execute("""insert into auth_tokens (provider, payload) values ('garmin', '{"garmin_tokens.json": "{}"}'::jsonb)""")
+        for role, password in SMOKE_PASSWORDS.items():
+            ensure_role(conn, role, password)
+        apply_coach_grants(conn, SMOKE_ROLES)
+        apply_coach_grants(conn, SMOKE_ROLES)  # re-runnable
+        seed_default_protocols(conn)
+        conn.commit()
+        for role in SMOKE_PASSWORDS:
+            assert_role_isolated(conn, role)
+    return tuple(url_for_role(DB_URL, r, SMOKE_PASSWORDS[r]) for r in ("smoke_coach", "smoke_scheduler"))
+
+
+def _denied(url: str, query: str, params: tuple = ()) -> bool:
+    with psycopg.connect(url) as conn:
+        try:
+            conn.execute(query, params)
+        except psycopg.errors.InsufficientPrivilege:
+            conn.rollback()
+            return True
+        conn.rollback()
+    return False
+
+
+def test_coach_role_isolation() -> None:
+    coach_url, sched_url = _setup_coach_loop()
+    tomorrow = date.today() + timedelta(days=1)
+    with psycopg.connect(coach_url) as conn:  # identity insert works through column grants
+        plan_id = conn.execute(
+            "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'finger-repeaters-7-3') returning id",
+            (tomorrow,),
+        ).fetchone()[0]
+        conn.execute("insert into protocols (slug, name, params) values ('x', 'x', '{}'::jsonb)")
+        conn.execute("select count(*) from workouts").fetchone()
+
+    # Acceptance 1 — coach
+    assert _denied(coach_url, "select * from auth_tokens")
+    assert _denied(coach_url, "insert into plan_approvals (plan_id, fingerprint) values (%s, 'f')", (plan_id,))
+    assert _denied(coach_url, "select * from plan_approvals")
+    assert _denied(coach_url, "insert into generated_workouts (protocol_slug, workout_id, params_hash) values ('a', 1, 'h')")
+    assert _denied(coach_url, "update training_plan set schedule_id = 1 where id = %s", (plan_id,))
+    assert _denied(coach_url, "update training_plan set status = 'scheduled' where id = %s", (plan_id,))
+    assert not _denied(coach_url, "update training_plan set skip = true where id = %s", (plan_id,))
+    with psycopg.connect(DB_URL) as conn:  # pretend the enactor put it on the calendar
+        conn.execute("update training_plan set resolved_workout_id = 1, enacted_date = %s where id = %s", (tomorrow, plan_id))
+    assert _denied(coach_url, "delete from training_plan where id = %s", (plan_id,)), "enacted rows must not be deletable"
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("update training_plan set resolved_workout_id = null, enacted_date = null where id = %s", (plan_id,))
+    assert not _denied(coach_url, "delete from training_plan where id = %s", (plan_id,)), "un-enacted rows stay deletable"
+    # Acceptance 1 — scheduler, as granted
+    assert not _denied(sched_url, "select * from auth_tokens")
+    assert not _denied(sched_url, "select * from plan_approvals")
+    assert _denied(sched_url, "insert into plan_approvals (plan_id, fingerprint) values (%s, 'f')", (plan_id,))
+    assert _denied(sched_url, "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', 'x')", (tomorrow,))
+    assert _denied(sched_url, "update training_plan set scheduled_date = scheduled_date where id = %s", (plan_id,))
+    print("test_coach_role_isolation: PASS")
+
+
+def test_scheduler_token_save() -> None:
+    _coach_url, sched_url = _setup_coach_loop()
+    from bootstrap.garmin_auth import TOKEN_DIR
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    with psycopg.connect(sched_url) as conn:
+        garmin_write.save_token_update_only(conn)  # UPDATE-only path works without INSERT
+    assert _denied(sched_url, "insert into auth_tokens (provider, payload) values ('x', '{}'::jsonb)")
+    print("test_scheduler_token_save: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -226,6 +309,8 @@ def main() -> None:
     test_disabled_domain_not_pulled()
     test_workouts_domain_tables_and_join()
     test_workouts_sync_keeps_rows_on_empty_listing()
+    test_coach_role_isolation()
+    test_scheduler_token_save()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
