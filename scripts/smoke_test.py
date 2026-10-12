@@ -7,12 +7,24 @@
 # ]
 # ///
 """
-Smoke test for the domain registry + migrations + upgrade flow. Run
-against a SCRATCH Neon database only — it drops and recreates the public
-schema.
+Smoke test for the domain registry + migrations + upgrade flow, and the
+coach loop. Run against a THROWAWAY Postgres only — it drops and recreates
+the public schema and creates cluster-wide roles (smoke_coach,
+smoke_scheduler), so never point it at your production Neon project.
 
-Usage:
-    SMOKE_TEST_DATABASE_URL="postgresql://...scratch-db..." uv run scripts/smoke_test.py
+Usage (local Docker):
+    docker run -d --rm --name garmin-smoke -e POSTGRES_PASSWORD=smoke -p 127.0.0.1:55432:5432 postgres:17
+    SMOKE_TEST_DATABASE_URL=postgresql://postgres:smoke@localhost:55432/postgres uv run scripts/smoke_test.py
+
+Coach-loop coverage (docs/superpowers/plans/2026-09-30-workout-coach-loop.md):
+the workouts domain tables + activity join and the empty-listing guard;
+role isolation (coach can't read auth_tokens, approve, write enactor
+columns, or delete an enacted row; scheduler can't approve or author) and
+the scheduler's UPDATE-only token save; the approval CLI and stale
+fingerprints; seeding only approved protocols and re-seeding on change;
+the enactor round trip with a fake Garmin (approval gate, idempotent
+re-runs, crash recovery, ambiguous names, same-day duplicates, reschedule,
+skip → unschedule); and that a read-only install has no coach config.
 
 Covers acceptance criteria 1, 2, 5, 6 from
 docs/superpowers/plans/2026-08-24-garmin-domains-upgrade.md. Criterion 3

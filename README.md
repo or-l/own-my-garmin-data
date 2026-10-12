@@ -157,6 +157,115 @@ it.
 
 ---
 
+## Coach loop (optional)
+
+Off by default. The coach loop lets a coach (you + Claude, through an MCP
+write tool) plan workouts in the database, lets **you** approve them, and
+then puts the approved ones on your Garmin calendar. It's the only part of
+this project that writes to Garmin, and the write is always manual.
+
+Turn it on with:
+
+```bash
+uv run install.py --coach-loop
+```
+
+The opt-in tells you up front that it **grants a component write access to
+your Garmin account and creates two scoped database users** (`coach` and
+`scheduler`). It also enables the read-only `workouts` domain, seeds two
+default protocols, and writes `COACH_DATABASE_URL` and
+`SCHEDULER_DATABASE_URL` to `.env`. Re-running it doesn't rotate existing
+passwords. A read-only install never creates these users.
+
+### Who can do what
+
+Isolation is enforced by Postgres roles and GRANTs, not by the code
+choosing to behave. Even a prompt injection riding in on synced data can't
+make the coach exceed its grants.
+
+| Actor | Garmin | DB credential | Trigger | Does |
+|---|---|---|---|---|
+| Ingestion | read | owner `DATABASE_URL` (unchanged — no separate ingestion role) | daily CI schedule | reads Garmin → ingestion tables |
+| MCP read tool | none | your MCP read role (e.g. `bk_garmin_data_mcp_reader`) | interactive | SELECT (never `auth_tokens`) |
+| MCP write tool ("coach") | none | `COACH_DATABASE_URL` | interactive | writes `training_plan`, `protocols` |
+| Enactor (`seed_workouts.py`, `sync_schedule.py`) | write | `SCHEDULER_DATABASE_URL` | **manual** | uploads/schedules; writes the ledger + enactment columns |
+| Approval CLI (`plan_admin.py`) | — | owner `DATABASE_URL` | **manual** | the only thing that can approve |
+
+| Table | coach | scheduler | owner |
+|---|---|---|---|
+| every public table except the two below | SELECT | SELECT | all |
+| `auth_tokens` | none | SELECT, UPDATE(payload, updated_at) | all |
+| `training_plan` | SELECT, INSERT/UPDATE(scheduled_date, source, protocol_slug, workout_id, workout_name, skip, note), DELETE (un-enacted rows only, by trigger), USAGE on id sequence | SELECT, UPDATE(status, schedule_id, resolved_workout_id, enacted_date) | all |
+| `protocols` | SELECT, INSERT, UPDATE, DELETE | SELECT | all |
+| `generated_workouts` | SELECT | SELECT, INSERT, UPDATE | all |
+| `plan_approvals` | none | SELECT | all (via plan_admin.py) |
+| read role (if configured and exists) | SELECT on every table except `auth_tokens` | | |
+
+### Two workout sources
+
+- **`generated`** — a row in `protocols` (a recipe: kind + params). The
+  seed job builds it and uploads it as a real Garmin workout. Only the
+  `other` kind (interval/hangboard repeaters) has a generator today.
+- **`library`** — any workout already in your Garmin library, of any type
+  (strength, run, catalog, hand-built), used as-is. Give it by `workout_id`
+  or by `workout_name` (exactly one). A name that matches 0 or 2+ library
+  workouts is skipped, never guessed — many catalog names repeat (e.g.
+  "Drill Workout"), so prefer `workout_id`.
+
+### The order things happen in
+
+1. Ingestion syncs your library and calendar (the `workouts` domain).
+2. The coach writes `training_plan` / `protocols` through `run_write_sql`.
+3. You review and approve: `uv run plan_admin.py list`, then
+   `uv run plan_admin.py approve --id N` (or `--date YYYY-MM-DD`).
+4. `uv run seed_workouts.py --confirm` uploads any approved generated workouts.
+5. `uv run sync_schedule.py --confirm` puts approved rows on the calendar —
+   or Actions tab → **garmin-enact** → Run workflow with **confirm** checked.
+
+Both enactor commands are dry runs without `--confirm` (or a typed `yes`
+at a terminal), and re-running them never duplicates anything.
+
+- **Approval is fingerprinted.** Editing an approved row or its protocol
+  voids the approval — `plan_admin.py list` shows it as STALE and the
+  enactor skips it until you approve again.
+- **Cancelling.** To cancel a session the coach sets `skip = true`. The
+  next enact removes it from the Garmin calendar, with no re-approval
+  needed (removal is the safe direction). A row that's on the calendar
+  can't be deleted until then. If two rows resolve to the same workout on
+  the same day, only one is scheduled.
+- **Manual-only enactment.** No cron workflow writes to Garmin. The CI
+  path (`garmin-enact`) needs the `SCHEDULER_DATABASE_URL` secret, which is
+  a standing Garmin-write-capable credential in CI; running the two
+  commands locally keeps it off shared infrastructure.
+
+### Did I do it?
+
+"Done" is derived, never stored — ingestion stays read-only:
+
+```sql
+select tp.*, a.activity_id
+  from training_plan tp
+  join activities a on (a.raw->>'workoutId')::bigint = tp.resolved_workout_id
+                   and (a.raw->>'startTimeLocal')::date = tp.enacted_date;
+```
+
+Garmin's own planned→done link (`associatedActivityId`) is also exposed by
+`get_scheduled_workout_by_id`, as an alternative to that join.
+
+**Data hygiene:** `Other`-typed workout activities carry junk
+distance/GPS and `exerciseSets: null`. Read what was actually done from
+`splitSummaries`, HR zones and `activityTrainingLoad`, and ignore
+distance/pace/GPS. Library workouts of proper types (run, strength) are
+self-describing.
+
+**Verified / not yet verified:** the calendar item `id` equals the
+`workoutScheduleId` (verified 2026-09-30), so unscheduling by calendar id
+is correct. Multi-set nesting (`sets > 1` in the generator) is **not yet
+verified** against a hand-built workout, so the default protocols are all
+single-set.
+
+---
+
 ## Automatic daily syncing (no computer needs to stay on)
 
 This uses GitHub Actions to run the sync automatically every day, on
