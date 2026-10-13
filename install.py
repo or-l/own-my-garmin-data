@@ -24,6 +24,9 @@ Guided first-time setup (and re-auth) for garmin-data.
     uv run install.py --domains a,b,c     # non-interactive domain selection for
                                            # setup or --upgrade (also settable via
                                            # GARMIN_DOMAINS).
+    uv run install.py --coach-loop        # opt in to the coach loop (creates two
+                                           # scoped DB roles; grants a component
+                                           # Garmin write access).
 
 Everything here is local orchestration of steps you could also do by hand
 (see README.md) — it doesn't introduce any new credential storage.
@@ -46,8 +49,13 @@ from rich.panel import Panel
 
 from apply_schema import apply_schema, apply_migrations, applied_versions, list_migrations
 from bootstrap.garmin_auth import interactive_login, save_token_to_db
-from config import get_enabled_domains, set_enabled_domains
+from coach_roles import (
+    CoachLoopRoles, apply_coach_grants, assert_role_isolated, ensure_role,
+    generate_password, role_exists, role_of_url, url_for_role,
+)
+from config import get_coach_loop, get_enabled_domains, set_coach_loop, set_enabled_domains
 from domains import DOMAINS, DOMAINS_BY_KEY, Domain
+from protocols import seed_default_protocols
 
 console = Console()
 
@@ -472,6 +480,13 @@ def run_upgrade(domains_override: set[str] | None = None) -> None:
     with psycopg.connect(database_url) as conn:
         set_enabled_domains(conn, selected_domains)
 
+    with psycopg.connect(database_url) as conn:
+        coach_cfg = get_coach_loop(conn)
+        if coach_cfg:
+            apply_coach_grants(conn, CoachLoopRoles.from_config(coach_cfg))
+            conn.commit()
+            console.print("[green]✓[/green] Re-applied coach-loop grants (covers tables added by this upgrade).")
+
     if applied:
         console.print(f"[green]✓[/green] Applied {len(applied)} migration(s): {', '.join(applied)}")
     else:
@@ -493,6 +508,91 @@ def run_upgrade(domains_override: set[str] | None = None) -> None:
     _print_manual_next_steps()
 
 
+COACH_LOOP_CONSENT = (
+    "[bold]Coach loop — optional, off by default.[/bold]\n\n"
+    "Turning this on [bold]grants a component write access to your Garmin account[/bold] "
+    "(the enactor — seed_workouts.py / sync_schedule.py — can upload workouts to your "
+    "library and put them on your calendar) and [bold]creates two scoped database users[/bold]:\n\n"
+    "  • coach — for the MCP write tool. Can edit training_plan and protocols. "
+    "Cannot read your Garmin token and cannot approve anything.\n"
+    "  • scheduler — for the enactor. Can read your Garmin token and write the workout "
+    "ledger. Acts only on plan rows you approve with plan_admin.py.\n\n"
+    "Nothing is written to Garmin until you approve a plan row AND run the enactor by "
+    "hand. A read-only install never needs this."
+)
+
+
+def run_coach_loop_optin(database_url: str, existing: dict[str, str]) -> None:
+    console.print(Panel(COACH_LOOP_CONSENT, title="Coach loop", border_style="magenta"))
+    if not questionary.confirm("Enable the coach loop?", default=False).ask():
+        console.print("Coach loop not enabled.")
+        return
+
+    with psycopg.connect(database_url) as conn:
+        enabled = get_enabled_domains(conn)
+        previous = get_coach_loop(conn) or {}
+    if "workouts" not in enabled:
+        console.print("The coach loop needs the read-only [bold]workouts[/bold] domain — enabling it.")
+        enabled = enabled | {"workouts"}
+        apply_migrations(database_url, enabled_domains=enabled)
+        with psycopg.connect(database_url) as conn:
+            set_enabled_domains(conn, enabled)
+
+    read_role = questionary.text(
+        "Your MCP read-only DB role, so it can SELECT the new tables (blank to skip):",
+        default=previous.get("read_role") or "",
+    ).ask() or ""
+    roles = CoachLoopRoles(read=read_role.strip() or None)
+
+    env_updates: dict[str, str] = {}
+    with psycopg.connect(database_url) as conn:
+        for role, env_key in ((roles.coach, "COACH_DATABASE_URL"), (roles.scheduler, "SCHEDULER_DATABASE_URL")):
+            if role_exists(conn, role) and role_of_url(existing.get(env_key)) == role:
+                continue  # already set up and we hold its URL — don't rotate the password
+            password = generate_password()
+            ensure_role(conn, role, password)
+            env_updates[env_key] = url_for_role(database_url, role, password)
+        apply_coach_grants(conn, roles)
+        inserted = seed_default_protocols(conn)
+        conn.commit()
+        for role in (roles.coach, roles.scheduler):
+            assert_role_isolated(conn, role)
+        set_coach_loop(conn, roles.to_config())
+
+    console.print(f"[green]✓[/green] Roles + grants applied; {inserted} default protocol(s) seeded.")
+    if env_updates:
+        _write_env(env_updates)
+        console.print(Panel(
+            "Written to .env:\n  " + "\n  ".join(env_updates) + "\n\n"
+            "• COACH_DATABASE_URL → set it on your MCP server (run_write_sql).\n"
+            "• SCHEDULER_DATABASE_URL → used by seed_workouts.py / sync_schedule.py.\n"
+            "• Approvals use your existing DATABASE_URL: uv run plan_admin.py list",
+            title="Coach loop credentials", border_style="green",
+        ))
+
+    scheduler_url = env_updates.get("SCHEDULER_DATABASE_URL") or existing.get("SCHEDULER_DATABASE_URL")
+    repo = _detect_github_repo()
+    if scheduler_url and repo and _gh_available()[0] and questionary.confirm(
+        "Also store SCHEDULER_DATABASE_URL as a GitHub Actions secret so the manual "
+        "garmin-enact workflow can run? This places a standing Garmin-write-capable "
+        "credential in CI (the local commands don't need it).",
+        default=False,
+    ).ask():
+        _set_gh_secret(repo, "SCHEDULER_DATABASE_URL", scheduler_url)
+        console.print("[green]✓[/green] Set SCHEDULER_DATABASE_URL secret.")
+
+
+def _offer_coach_loop() -> None:
+    existing = _read_existing_env()
+    database_url = existing.get("DATABASE_URL")
+    if not database_url:
+        return
+    with psycopg.connect(database_url) as conn:
+        if get_coach_loop(conn):
+            return
+    run_coach_loop_optin(database_url, existing)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reauth", action="store_true", help="Re-authenticate to Garmin only, skip full setup.")
@@ -504,6 +604,10 @@ def main() -> None:
         "--domains", type=str, default=None,
         help="Comma-separated domain keys (see domains.py), bypasses the interactive checklist (setup and --upgrade). Also settable via GARMIN_DOMAINS.",
     )
+    parser.add_argument(
+        "--coach-loop", action="store_true",
+        help="Opt in to the coach loop: creates the coach/scheduler DB roles and grants a component Garmin write access.",
+    )
     args = parser.parse_args()
 
     raw_domains = args.domains or os.environ.get("GARMIN_DOMAINS")
@@ -512,10 +616,18 @@ def main() -> None:
     try:
         if args.reauth:
             run_reauth()
+        elif args.coach_loop:
+            existing = _read_existing_env()
+            database_url = existing.get("DATABASE_URL") or _prompt_db_url(
+                "Neon connection string (DATABASE_URL)", "DATABASE_URL", existing)
+            _check_connection(database_url, "DATABASE_URL")
+            run_coach_loop_optin(database_url, existing)
         elif args.upgrade:
             run_upgrade(domains_override=domains_override)
+            _offer_coach_loop()
         else:
             run_setup(domains_override=domains_override)
+            _offer_coach_loop()
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
         sys.exit(1)

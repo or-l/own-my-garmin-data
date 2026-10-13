@@ -29,6 +29,7 @@ by `install.py`'s checklist at first-time setup and adjustable later with
 | `training` | on | `training_insight`, `performance_snapshots`, `personal_records` |
 | `challenges` | on | `challenges`, `earned_badges`, `available_badges` |
 | `profile` | on | `user_profile`, `goals` |
+| `workouts` | off | `workouts`, `scheduled_workouts` (read-only); its migrations also create the coach-loop planning tables `training_plan`, `protocols`, `generated_workouts`, `plan_approvals`, which are only writable after `install.py --coach-loop` |
 | `reproductive` | off (not yet implemented) | menstrual calendar / pregnancy data — gated on a live probe, see the plan doc |
 
 Schema for each domain lives in its own `-- domain: <key>`-tagged file
@@ -76,6 +77,9 @@ sessions if a shape ever needs re-checking against a live account.
 | `get_goals` | `goals` — **no verified id field** (this account has zero goals in any status, so the response shape's natural key couldn't be confirmed against real data). Stored via delete-then-insert per status (`active`/`future`/`past`) with a surrogate `bigserial` id, instead of guessing a primary key to upsert on. If you later see real goal data with a stable id field, switch this to an upsert like `personal_records`. |
 | `get_user_profile` | `user_profile.profile` (singleton row, `id = 1`) — physiological baseline: weight, height, birthDate, gender, `vo2MaxRunning`/`vo2MaxCycling`, `lactateThresholdSpeed`/`lactateThresholdHeartRate`, HR-zone auto-detection flags, under a `userData` key. Confirmed live: no explicit maxHR field or HR-zone-boundaries array exists in this response — `lactateThresholdHeartRate` and `vo2MaxRunning` are the closest baseline reference points actually present. Note: `userData.lactateThresholdSpeed`/`lactateThresholdHeartRate` here are the same values as `performance_snapshots.lactate_threshold`'s `speed_and_heart_rate.speed`/`.heartRate` — one physiological reading exposed via two endpoints, not two independent ones. |
 | `get_userprofile_settings` | `user_profile.settings` (same singleton row) — confirmed live to be purely locale/unit/display preferences (`timeZone`, `measurementSystem`, date/number/hydration formats). No physiological content, despite the similar method name to `get_user_profile` above — kept as a separate jsonb column rather than merged into `profile`, since the two responses don't overlap. |
+| `get_workouts` | `workouts` (workouts domain) — paged list; its `updateDate` is the change marker (the detail endpoint calls it `updatedDate`), so unchanged workouts aren't re-expanded. An empty listing never wipes the table. |
+| `get_workout_by_id` | `workouts.raw` — the full workout (steps + description) for each new/changed workout. Join: `activities.raw->>'workoutId'`. |
+| `get_scheduled_workouts` | `scheduled_workouts` — called per month with a **1-based** month (the library converts). Each response is the whole calendar grid, including neighbouring-month days and non-workout items, so items are filtered to `itemType = 'workout'` and deduped by `id` (which equals `workoutScheduleId`, verified 2026-09-30). Window: start of this month → +62 days. |
 
 ## Investigated, deliberately not used (duplicates)
 
@@ -109,11 +113,11 @@ not per date): `get_activity`, `get_activity_details`, `get_activity_splits`,
 **Gear**: `get_gear`, `get_gear_activities`, `get_gear_defaults`,
 `get_gear_stats`.
 
-**Workouts / training plans**: `get_workouts`, `get_workout_by_id`,
-`get_scheduled_workouts`, `get_scheduled_workout_by_id`,
+**Workouts / training plans** (beyond what the `workouts` domain and the
+coach loop use): `get_scheduled_workout_by_id`,
 `get_training_plans`, `get_training_plan_by_id`,
-`get_adaptive_training_plan_by_id`, `schedule_workout`,
-`unschedule_workout`, `upload_workout`, `upload_cycling_workout`,
+`get_adaptive_training_plan_by_id`,
+`upload_cycling_workout`,
 `upload_hiking_workout`, `upload_running_workout`,
 `upload_swimming_workout`, `upload_walking_workout`, `download_workout`.
 
@@ -142,11 +146,14 @@ not per date): `get_activity`, `get_activity_details`, `get_activity_splits`,
 `get_stats_and_body`, `get_stress_data`, `get_weekly_steps`,
 `query_garmin_graphql`, `request_reload`.
 
-**Write operations** (out of scope — this project is read-only against
-Garmin): `add_weigh_in`, `add_weigh_in_with_timestamps`, `delete_weigh_in`,
+**Write operations**: ingestion is read-only; the only writes are
+`upload_workout`, `schedule_workout`, `unschedule_workout` and
+`delete_workout`, confined to `garmin_write.py` (an AST test enforces it)
+and used only by the manual, approval-gated coach loop (see README).
+Everything else below remains unused: `add_weigh_in`, `add_weigh_in_with_timestamps`, `delete_weigh_in`,
 `delete_weigh_ins`, `add_body_composition`, `add_gear_to_activity`,
 `remove_gear_from_activity`, `set_gear_default`, `create_manual_activity`,
-`create_manual_activity_from_json`, `delete_activity`, `delete_workout`,
+`create_manual_activity_from_json`, `delete_activity`,
 `import_activity`, `upload_activity`, `set_activity_name`,
 `set_activity_type`, `set_activity_description`,
 `set_activity_exercise_sets`.
