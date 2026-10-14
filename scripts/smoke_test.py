@@ -608,6 +608,27 @@ def test_review_fixes() -> None:
     print("test_review_fixes: PASS")
 
 
+def test_coach_tables_are_self_describing() -> None:
+    """The MCP coach only sees the database, so the workflow must live in
+    table/column comments it can read (postgres-mcp surfaces them)."""
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    with psycopg.connect(DB_URL) as conn:
+        def comment(table):
+            return conn.execute("select obj_description(%s::regclass, 'pg_class')", (table,)).fetchone()[0] or ""
+        assert "run_write_sql" in comment("training_plan") and "approve" in comment("training_plan")
+        assert "params" in comment("protocols")
+        for t in ("workouts", "scheduled_workouts", "generated_workouts"):
+            assert "READ-ONLY" in comment(t), t
+        undocumented = [r[0] for r in conn.execute(
+            "select a.attname from pg_attribute a where a.attrelid = 'training_plan'::regclass "
+            "and a.attnum > 0 and not a.attisdropped and col_description(a.attrelid, a.attnum) is null"
+        ).fetchall()]
+        assert undocumented == [], f"training_plan columns without comments: {undocumented}"
+    print("test_coach_tables_are_self_describing: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -623,6 +644,7 @@ def main() -> None:
     test_enactor_round_trip()
     test_review_fixes()
     test_read_only_install_has_no_coach_config()
+    test_coach_tables_are_self_describing()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
