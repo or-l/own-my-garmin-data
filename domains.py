@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Callable
@@ -465,6 +466,57 @@ def _replace_scheduled(conn: psycopg.Connection, items: dict[int, dict], window:
         )
 
 
+CATALOG_URL = "https://connect.garmin.com/web-data/exercises/Exercises.json"
+CATALOG_MAX_AGE_DAYS = 7
+
+
+def parse_exercise_catalog(doc: dict | None) -> list[tuple[str, str, list[str], list[str], str | None]]:
+    """Garmin's {"categories": {CAT: {"exercises": {NAME: {...}}}}} -> rows,
+    sorted by (category, exercise). Tolerates missing/empty pieces."""
+    rows = []
+    categories = (doc or {}).get("categories") if isinstance(doc, dict) else None
+    for category, body in sorted((categories or {}).items()):
+        for exercise, info in sorted(((body or {}).get("exercises") or {}).items()):
+            info = info or {}
+            rows.append((category, exercise, list(info.get("primaryMuscles") or []),
+                         list(info.get("secondaryMuscles") or []), info.get("counterpart")))
+    return rows
+
+
+def _fetch_catalog_doc() -> dict:
+    """Public, unauthenticated static file the Connect web app loads.
+    stdlib only: the ingestion runner has no `requests`."""
+    req = urllib.request.Request(CATALOG_URL, headers={"User-Agent": "garmin-data"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def _refresh_exercise_catalog(conn: psycopg.Connection, today: date) -> int:
+    last = conn.execute("select max(synced_at) from exercise_catalog").fetchone()[0]
+    if last is not None and last.date() > today - timedelta(days=CATALOG_MAX_AGE_DAYS):
+        return 0
+    try:
+        rows = parse_exercise_catalog(_fetch_catalog_doc())
+    except Exception as e:  # network, HTTP, bad JSON — keep what we have
+        print(f"exercise catalog: fetch failed, keeping existing rows ({e})")
+        return 0
+    if not rows:
+        print("exercise catalog: empty/unrecognised response, keeping existing rows")
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            insert into exercise_catalog (category, exercise, primary_muscles, secondary_muscles, counterpart, synced_at)
+            values (%s, %s, %s, %s, %s, now())
+                on conflict (category, exercise) do update set
+                primary_muscles = excluded.primary_muscles, secondary_muscles = excluded.secondary_muscles,
+                counterpart = excluded.counterpart, synced_at = now()
+            """,
+            rows,
+        )
+    conn.commit()
+    return len(rows)
+
 def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
     listing = _fetch_workout_list(ctx.client)
     stored = dict(ctx.conn.execute("select workout_id, updated_date from workouts").fetchall())
@@ -490,7 +542,8 @@ def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
     scheduled = _fetch_scheduled(ctx.client, ctx.today, end)
     _replace_scheduled(ctx.conn, scheduled, month_window(ctx.today, end))
     ctx.conn.commit()
-    return {"workouts": len(listing), "scheduled_workouts": len(scheduled)}
+    catalog = _refresh_exercise_catalog(ctx.conn, ctx.today)
+    return {"workouts": len(listing), "scheduled_workouts": len(scheduled), "exercise_catalog": catalog}
 
 
 # --------------------------------------------------------------------- registry

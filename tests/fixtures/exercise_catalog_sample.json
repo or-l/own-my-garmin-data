@@ -1,0 +1,7 @@
+{"categories": {
+  "PULL_UP": {"exercises": {
+    "WEIGHTED_PULL_UP": {"counterpart": "PULL_UP", "primaryMuscles": ["LATS", "TRAPS"], "secondaryMuscles": ["BICEPS", "FOREARM", "SHOULDERS"]},
+    "PULL_UP": {"counterpart": "WEIGHTED_PULL_UP", "primaryMuscles": ["LATS"], "secondaryMuscles": ["BICEPS"]}}},
+  "PLANK": {"exercises": {"PLANK": {"primaryMuscles": ["ABS"]}}},
+  "EMPTY": {"exercises": {}}
+}}

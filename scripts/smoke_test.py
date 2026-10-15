@@ -61,6 +61,17 @@ DB_URL = os.environ["SMOKE_TEST_DATABASE_URL"]
 OLD_INIT_SQL = pathlib.Path(__file__).resolve().parent.parent / "schema" / "init.sql"
 
 
+def _fake_catalog_doc() -> dict:
+    return {"categories": {
+        "PULL_UP": {"exercises": {"WEIGHTED_PULL_UP": {"primaryMuscles": ["LATS"]}, "PULL_UP": {}}},
+        "PLANK": {"exercises": {"PLANK": {}}},
+        "ROW": {"exercises": {"DUMBBELL_ROW": {}}},
+    }}
+
+
+domains._fetch_catalog_doc = _fake_catalog_doc
+
+
 def _reset_db(conn: psycopg.Connection) -> None:
     conn.execute("drop schema public cascade; create schema public;")
     conn.commit()
@@ -662,6 +673,30 @@ def test_strength_schema_and_view() -> None:
     print("test_strength_schema_and_view: PASS")
 
 
+def test_exercise_catalog_refresh_keeps_rows_on_failure() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    sample = json.loads((pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+                         / "exercise_catalog_sample.json").read_text())
+    today = date.today()
+    with psycopg.connect(DB_URL) as conn:
+        domains._fetch_catalog_doc = lambda: sample
+        assert domains._refresh_exercise_catalog(conn, today) == 3
+        assert domains._refresh_exercise_catalog(conn, today) == 0, "fresh catalogue must not refetch"
+        conn.execute("update exercise_catalog set synced_at = now() - interval '8 days'")
+        conn.commit()
+
+        def boom():
+            raise OSError("network down")
+        for failing in (boom, lambda: {"html": "<b>oops</b>"}, lambda: {}):
+            domains._fetch_catalog_doc = failing
+            assert domains._refresh_exercise_catalog(conn, today) == 0
+            assert conn.execute("select count(*) from exercise_catalog").fetchone()[0] == 3, "rows must survive"
+    domains._fetch_catalog_doc = _fake_catalog_doc
+    print("test_exercise_catalog_refresh_keeps_rows_on_failure: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -679,6 +714,7 @@ def main() -> None:
     test_read_only_install_has_no_coach_config()
     test_coach_tables_are_self_describing()
     test_strength_schema_and_view()
+    test_exercise_catalog_refresh_keeps_rows_on_failure()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
