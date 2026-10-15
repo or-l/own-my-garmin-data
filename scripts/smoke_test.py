@@ -835,6 +835,59 @@ def test_exercise_sets_ignores_non_dict_payload() -> None:
     print("test_exercise_sets_ignores_non_dict_payload: PASS")
 
 
+def test_plan_admin_review_checklists() -> None:
+    import plan_admin
+    coach_url, _sched_url = _setup_coach_loop()
+    tomorrow = date.today() + timedelta(days=1)
+    with psycopg.connect(coach_url) as conn:
+        ids = [conn.execute(
+            "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', %s) returning id",
+            (tomorrow + timedelta(days=i), slug)).fetchone()[0]
+            for i, slug in enumerate(("finger-repeaters-7-3", "finger-max-hangs-10", "finger-repeaters-7-3"))]
+    a, b, c = ids
+
+    def state():
+        with psycopg.connect(DB_URL) as conn:
+            approved = {r[0] for r in conn.execute("select plan_id from plan_approvals").fetchall()}
+            skipped = {r[0] for r in conn.execute("select id from training_plan where skip").fetchall()}
+        return approved, skipped
+
+    seen = {}
+
+    def ask_approve(choices):
+        seen["approve"] = [cid for _, cid in choices]
+        return [a]
+
+    def ask_skip(choices):
+        seen["skip"] = [cid for _, cid in choices]
+        return [b]
+
+    # declined at the final confirmation -> nothing changes
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.review(conn, ask_approve, ask_skip, lambda summary: False)
+    assert state() == (set(), set())
+    assert seen == {"approve": [a, b, c], "skip": [b, c]}, seen  # skip list only offers what wasn't approved
+
+    # coach edits row a while the checklist is open -> its approval lands STALE
+    def ask_approve_then_edit(choices):
+        with psycopg.connect(coach_url) as cconn:
+            cconn.execute("update training_plan set scheduled_date = scheduled_date + 7 where id = %s", (a,))
+        return [a]
+
+    with psycopg.connect(DB_URL) as conn:
+        summary = plan_admin.review(conn, ask_approve_then_edit, ask_skip, lambda s: True)
+        assert f"approve {a}" in summary and f"skip {b}" in summary and f"leave {c}" in summary, summary
+        assert planning.load_plan(conn, ids=[a])[0].approval == "stale"
+    assert state() == ({a}, {b})
+
+    # nothing ticked anywhere -> nothing to do, no confirmation asked
+    asked = []
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.review(conn, lambda ch: [], lambda ch: [], lambda s: asked.append(s) or True)
+    assert asked == [] and state() == ({a}, {b})
+    print("test_plan_admin_review_checklists: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -846,6 +899,7 @@ def main() -> None:
     test_coach_role_isolation()
     test_scheduler_token_save()
     test_plan_admin_approve_unapprove()
+    test_plan_admin_review_checklists()
     test_seed_only_approved_and_rehash()
     test_enactor_round_trip()
     test_review_fixes()
