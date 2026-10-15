@@ -738,6 +738,52 @@ def test_exercise_sets_fetch_if_missing() -> None:
     print("test_exercise_sets_fetch_if_missing: PASS")
 
 
+def test_seed_validates_strength_protocols() -> None:
+    import plan_admin
+    coach_url, sched_url = _setup_coach_loop()
+    seed_workouts.POLITENESS_SLEEP_S = 0
+    tomorrow = date.today() + timedelta(days=1)
+    good = {"exercises": [{"category": "PULL_UP", "exercise": "WEIGHTED_PULL_UP", "sets": 4, "reps": 3, "weight_kg": 10, "rest_s": 180}]}
+    bad_pair = {"exercises": [{"category": "ROW", "exercise": "PULL_UP", "sets": 3, "reps": 5}]}
+    bad_shape = {"exercises": [{"category": "PULL_UP", "exercise": "PULL_UP", "sets": 3, "reps": 5, "weight": 10}]}
+    with psycopg.connect(DB_URL) as conn:  # catalogue as ingestion would have it
+        conn.execute("insert into exercise_catalog (category, exercise) values ('PULL_UP','WEIGHTED_PULL_UP'), ('PULL_UP','PULL_UP')")
+        conn.commit()
+    with psycopg.connect(coach_url) as conn:
+        ids = []
+        for slug, params, day in (("s-good", good, tomorrow), ("s-pair", bad_pair, tomorrow + timedelta(days=1)),
+                                  ("s-shape", bad_shape, tomorrow + timedelta(days=2))):
+            conn.execute("insert into protocols (slug, name, kind, params) values (%s, %s, 'strength', %s)",
+                         (slug, slug, json.dumps(params)))
+            ids.append(conn.execute(
+                "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', %s) returning id",
+                (day, slug)).fetchone()[0])
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, ids, None)
+    with psycopg.connect(sched_url) as conn:
+        actions, notes = seed_workouts.plan_seed(conn, date.today())
+        assert [a.slug for a in actions] == ["s-good"], actions
+        joined = " | ".join(notes)
+        assert "s-pair" in joined and "ROW/PULL_UP" in joined, notes
+        assert "s-shape" in joined and "weight" in joined, notes
+        fake = FakeGarmin()
+        seed_workouts.run(conn, lambda: contextlib.nullcontext(fake), today=date.today(), confirm=_yes)
+    assert len(fake.uploads) == 1
+    uploaded = fake.library[fake.uploads[0]]
+    assert uploaded["sportType"]["sportTypeKey"] == "strength_training"
+    ex = uploaded["workoutSegments"][0]["workoutSteps"][1]["workoutSteps"][0]
+    assert (ex["exerciseName"], ex["weightValue"]) == ("WEIGHTED_PULL_UP", 10.0)
+
+    with psycopg.connect(DB_URL) as conn:  # empty catalogue -> refuse every strength protocol
+        conn.execute("delete from exercise_catalog")
+        conn.execute("delete from generated_workouts")
+        conn.commit()
+    with psycopg.connect(sched_url) as conn:
+        actions, notes = seed_workouts.plan_seed(conn, date.today())
+    assert actions == [] and any("not synced" in n for n in notes), notes
+    print("test_seed_validates_strength_protocols: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -757,6 +803,7 @@ def main() -> None:
     test_strength_schema_and_view()
     test_exercise_catalog_refresh_keeps_rows_on_failure()
     test_exercise_sets_fetch_if_missing()
+    test_seed_validates_strength_protocols()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 

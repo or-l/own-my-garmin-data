@@ -59,8 +59,15 @@ def plan_seed(conn: psycopg.Connection, today: date) -> tuple[list[SeedAction], 
     wanted = {v.row.protocol_slug: v.proto_hash for v in ready if v.row.source == "generated"}
     ledger = {slug: (wid, h) for slug, wid, h in
               conn.execute("select protocol_slug, workout_id, params_hash from generated_workouts").fetchall()}
+    protos = {slug: (kind, name, description, params) for slug, kind, name, description, params in conn.execute(
+        "select slug, kind, name, description, params from protocols where slug = any(%s)", (sorted(wanted),)
+    ).fetchall()}
     actions = []
     for slug, current in sorted(wanted.items()):
+        problems = protocols.protocol_problems(conn, *protos[slug])
+        if problems:
+            notes.append(f"protocol {slug}: not uploaded — {'; '.join(problems)}")
+            continue
         entry = ledger.get(slug)
         if entry is None:
             actions.append(SeedAction(slug, "upload", current))

@@ -23,3 +23,9 @@ def test_unknown_kind_is_a_clear_error():
 
 def test_defaults_are_single_set_until_multiset_verified():
     assert all(p["params"].get("sets", 1) == 1 for p in DEFAULT_PROTOCOLS.values())
+
+
+def test_strength_builds_through_dispatch():
+    params = {"exercises": [{"category": "PLANK", "exercise": "PLANK", "sets": 3, "time_s": 45}]}
+    w = build("strength", "Core", "plank day", params)
+    assert w["sportType"]["sportTypeKey"] == "strength_training" and w["workoutName"] == "Core"
