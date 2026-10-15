@@ -784,6 +784,57 @@ def test_seed_validates_strength_protocols() -> None:
     print("test_seed_validates_strength_protocols: PASS")
 
 
+def test_view_survives_malformed_sets() -> None:
+    """One odd set must not break every coach query on the view."""
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    odd = {"exerciseSets": [
+        {"setType": "ACTIVE", "repetitionCount": 5.0, "weight": "heavy", "duration": "x", "startTime": "not a time",
+         "exercises": {"category": "PULL_UP"}},
+        {"setType": "ACTIVE", "repetitionCount": 6, "weight": 10000.0, "duration": 30.0, "startTime": "2026-10-01T18:56:17.0",
+         "exercises": [{"category": "PULL_UP", "name": "PULL_UP", "probability": "high"}]},
+    ]}
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("insert into activity_exercise_sets (activity_id, raw) values (7, %s)", (json.dumps(odd),))
+        rows = conn.execute("select set_index, reps, weight_kg, duration_s, start_time_utc, category, exercise, probability "
+                            "from activity_exercise_set_rows order by set_index").fetchall()
+    assert rows[0] == (0, 5, None, None, None, None, None, None), rows
+    assert rows[1][:3] == (1, 6, Decimal("10.0")) and rows[1][5:] == ("PULL_UP", "PULL_UP", None), rows
+    print("test_view_survives_malformed_sets: PASS")
+
+
+def test_workouts_sync_before_strength_migration() -> None:
+    """Code merged before 0011 is applied: the daily sync must still run."""
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("drop view activity_exercise_set_rows; drop table exercise_catalog; drop table activity_exercise_sets")
+        conn.commit()
+        ctx = SyncContext(client=_WorkoutsStub([{"workoutId": 42, "updateDate": "u1"}]), conn=conn,
+                          window_start=date.today(), today=date.today())
+        counts = domains._workouts_sync(ctx)
+        assert counts["exercise_catalog"] == 0 and counts["activity_exercise_sets"] == 0, counts
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "ingestion"))
+        import pull
+        assert pull.table_count(conn, "exercise_catalog") == 0
+    print("test_workouts_sync_before_strength_migration: PASS")
+
+
+def test_exercise_sets_ignores_non_dict_payload() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    domains.EXERCISE_SETS_SLEEP_S = 0
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("insert into activities (activity_id, raw, started_at) values (20, %s, now())",
+                     (json.dumps({"activityType": {"typeKey": "strength_training"}}),))
+        conn.commit()
+        assert domains._sync_exercise_sets(conn, _SetsStub({20: [{"setType": "ACTIVE"}]}), date.today()) == 0
+    print("test_exercise_sets_ignores_non_dict_payload: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -804,6 +855,9 @@ def main() -> None:
     test_exercise_catalog_refresh_keeps_rows_on_failure()
     test_exercise_sets_fetch_if_missing()
     test_seed_validates_strength_protocols()
+    test_view_survives_malformed_sets()
+    test_workouts_sync_before_strength_migration()
+    test_exercise_sets_ignores_non_dict_payload()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 

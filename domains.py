@@ -476,11 +476,20 @@ def parse_exercise_catalog(doc: dict | None) -> list[tuple[str, str, list[str], 
     rows = []
     categories = (doc or {}).get("categories") if isinstance(doc, dict) else None
     for category, body in sorted((categories or {}).items()):
-        for exercise, info in sorted(((body or {}).get("exercises") or {}).items()):
-            info = info or {}
-            rows.append((category, exercise, list(info.get("primaryMuscles") or []),
-                         list(info.get("secondaryMuscles") or []), info.get("counterpart")))
+        exercises = (body or {}).get("exercises") if isinstance(body, dict) else None
+        for exercise, info in sorted((exercises or {}).items()) if isinstance(exercises, dict) else []:
+            info = info if isinstance(info, dict) else {}
+            counterpart = info.get("counterpart")
+            rows.append((category, exercise, _str_list(info.get("primaryMuscles")),
+                         _str_list(info.get("secondaryMuscles")),
+                         counterpart if isinstance(counterpart, str) else None))
     return rows
+
+
+def _str_list(value) -> list[str]:
+    """Muscle lists as Garmin should send them; anything else (a bare string,
+    numbers, objects) is dropped rather than stored wrong."""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
 def _fetch_catalog_doc() -> dict:
@@ -491,7 +500,13 @@ def _fetch_catalog_doc() -> dict:
         return json.load(resp)
 
 
+def _table_exists(conn: psycopg.Connection, table: str) -> bool:
+    return conn.execute("select to_regclass(%s)", (table,)).fetchone()[0] is not None
+
+
 def _refresh_exercise_catalog(conn: psycopg.Connection, today: date) -> int:
+    if not _table_exists(conn, "exercise_catalog"):
+        return 0  # code deployed before migration 0011 — run install.py --upgrade
     last = conn.execute("select max(synced_at) from exercise_catalog").fetchone()[0]
     if last is not None and last.date() > today - timedelta(days=CATALOG_MAX_AGE_DAYS):
         return 0
@@ -525,8 +540,8 @@ def _sync_exercise_sets(conn: psycopg.Connection, client, today: date) -> int:
     """Fetch-if-missing: per-set results for recent strength activities that
     don't have a row yet. An empty/None payload or an error stores nothing,
     so the activity is retried on the next sync."""
-    if conn.execute("select to_regclass('activities')").fetchone()[0] is None:
-        return 0
+    if not (_table_exists(conn, "activities") and _table_exists(conn, "activity_exercise_sets")):
+        return 0  # activities domain off, or code deployed before migration 0011
     ids = [r[0] for r in conn.execute(
         """
         select a.activity_id from activities a
@@ -545,7 +560,7 @@ def _sync_exercise_sets(conn: psycopg.Connection, client, today: date) -> int:
         except Exception as e:
             print(f"exercise sets for activity {activity_id}: fetch failed, will retry ({e})")
             payload = None
-        if (payload or {}).get("exerciseSets"):
+        if isinstance(payload, dict) and payload.get("exerciseSets"):
             conn.execute(
                 """
                 insert into activity_exercise_sets (activity_id, raw, synced_at) values (%s, %s, now())

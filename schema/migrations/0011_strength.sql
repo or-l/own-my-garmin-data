@@ -22,15 +22,21 @@ create table if not exists activity_exercise_sets (
 
 -- One row per set. Garmin reports weight in grams (12500 = 12.5 kg in the
 -- app); startTime is UTC. The exercise shown is the watch's top guess for
--- that set (for a guided workout, the planned exercise).
+-- that set (for a guided workout, the planned exercise). Every cast is
+-- guarded by jsonb_typeof: one odd value must give a NULL, never break the
+-- whole view (column types can't change after it's created).
 create or replace view activity_exercise_set_rows as
 select s.activity_id,
-       (e.ord - 1)::int                                   as set_index,
-       e.item->>'setType'                                 as set_type,
-       (e.item->>'repetitionCount')::int                  as reps,
-       round((e.item->>'weight')::numeric / 1000.0, 1)    as weight_kg,
-       round((e.item->>'duration')::numeric, 1)           as duration_s,
-       (e.item->>'startTime')::timestamp                  as start_time_utc,
+       (e.ord - 1)::int                                                    as set_index,
+       e.item->>'setType'                                                  as set_type,
+       case when jsonb_typeof(e.item->'repetitionCount') = 'number'
+            then round((e.item->>'repetitionCount')::numeric)::int end    as reps,
+       case when jsonb_typeof(e.item->'weight') = 'number'
+            then round((e.item->>'weight')::numeric / 1000.0, 1) end      as weight_kg,
+       case when jsonb_typeof(e.item->'duration') = 'number'
+            then round((e.item->>'duration')::numeric, 1) end             as duration_s,
+       case when (e.item->>'startTime') ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}'
+            then (left(e.item->>'startTime', 19))::timestamp end          as start_time_utc,
        top.category,
        top.exercise,
        top.probability
@@ -39,9 +45,14 @@ select s.activity_id,
            case when jsonb_typeof(s.raw->'exerciseSets') = 'array' then s.raw->'exerciseSets' else '[]'::jsonb end
        ) with ordinality as e(item, ord)
   left join lateral (
-        select x->>'category' as category, x->>'name' as exercise, (x->>'probability')::numeric as probability
-          from jsonb_array_elements(coalesce(e.item->'exercises', '[]'::jsonb)) x
-         order by (x->>'probability')::numeric desc nulls last
+        select x->>'category' as category,
+               x->>'name'     as exercise,
+               case when jsonb_typeof(x->'probability') = 'number' then (x->>'probability')::numeric end as probability
+          from jsonb_array_elements(
+                   case when jsonb_typeof(e.item->'exercises') = 'array' then e.item->'exercises' else '[]'::jsonb end
+               ) x
+         where jsonb_typeof(x) = 'object'
+         order by case when jsonb_typeof(x->'probability') = 'number' then (x->>'probability')::numeric end desc nulls last
          limit 1
   ) top on true;
 

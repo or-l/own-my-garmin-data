@@ -72,8 +72,8 @@ def protocol_problems(conn: psycopg.Connection, kind: str, name: str, descriptio
     the catalogue check."""
     try:
         build(kind, name, description, params)
-    except (ValueError, TypeError) as e:
-        return [str(e)]
+    except Exception as e:  # any bad input (incl. OverflowError on absurd numbers) is a note, never a crash
+        return [f"{type(e).__name__}: {e}" if not isinstance(e, ValueError) else str(e)]
     if kind == "strength":
         return strength_problems(conn, params)
     return []
