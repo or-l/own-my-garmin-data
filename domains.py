@@ -517,6 +517,47 @@ def _refresh_exercise_catalog(conn: psycopg.Connection, today: date) -> int:
     conn.commit()
     return len(rows)
 
+EXERCISE_SETS_LOOKBACK_DAYS = 30
+EXERCISE_SETS_SLEEP_S = 1.0
+
+
+def _sync_exercise_sets(conn: psycopg.Connection, client, today: date) -> int:
+    """Fetch-if-missing: per-set results for recent strength activities that
+    don't have a row yet. An empty/None payload or an error stores nothing,
+    so the activity is retried on the next sync."""
+    if conn.execute("select to_regclass('activities')").fetchone()[0] is None:
+        return 0
+    ids = [r[0] for r in conn.execute(
+        """
+        select a.activity_id from activities a
+          left join activity_exercise_sets s on s.activity_id = a.activity_id
+         where s.activity_id is null
+           and a.raw->'activityType'->>'typeKey' = 'strength_training'
+           and a.started_at >= %s
+         order by a.started_at
+        """,
+        (today - timedelta(days=EXERCISE_SETS_LOOKBACK_DAYS),),
+    ).fetchall()]
+    stored = 0
+    for activity_id in ids:
+        try:
+            payload = client.get_activity_exercise_sets(activity_id)
+        except Exception as e:
+            print(f"exercise sets for activity {activity_id}: fetch failed, will retry ({e})")
+            payload = None
+        if (payload or {}).get("exerciseSets"):
+            conn.execute(
+                """
+                insert into activity_exercise_sets (activity_id, raw, synced_at) values (%s, %s, now())
+                    on conflict (activity_id) do update set raw = excluded.raw, synced_at = now()
+                """,
+                (activity_id, json.dumps(payload)),
+            )
+            conn.commit()
+            stored += 1
+        time.sleep(EXERCISE_SETS_SLEEP_S)
+    return stored
+
 def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
     listing = _fetch_workout_list(ctx.client)
     stored = dict(ctx.conn.execute("select workout_id, updated_date from workouts").fetchall())
@@ -543,7 +584,9 @@ def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
     _replace_scheduled(ctx.conn, scheduled, month_window(ctx.today, end))
     ctx.conn.commit()
     catalog = _refresh_exercise_catalog(ctx.conn, ctx.today)
-    return {"workouts": len(listing), "scheduled_workouts": len(scheduled), "exercise_catalog": catalog}
+    sets = _sync_exercise_sets(ctx.conn, ctx.client, ctx.today)
+    return {"workouts": len(listing), "scheduled_workouts": len(scheduled),
+            "exercise_catalog": catalog, "activity_exercise_sets": sets}
 
 
 # --------------------------------------------------------------------- registry

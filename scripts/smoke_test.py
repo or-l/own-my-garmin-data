@@ -217,6 +217,9 @@ class _WorkoutsStub:
     def get_scheduled_workouts(self, year, month):
         return {"calendarItems": []}
 
+    def get_activity_exercise_sets(self, activity_id):
+        return None
+
 
 def test_workouts_domain_tables_and_join() -> None:
     with psycopg.connect(DB_URL) as conn:
@@ -697,6 +700,44 @@ def test_exercise_catalog_refresh_keeps_rows_on_failure() -> None:
     print("test_exercise_catalog_refresh_keeps_rows_on_failure: PASS")
 
 
+class _SetsStub:
+    def __init__(self, payloads: dict):
+        self.payloads, self.calls = payloads, []
+
+    def get_activity_exercise_sets(self, activity_id):
+        self.calls.append(activity_id)
+        payload = self.payloads.get(activity_id)
+        if isinstance(payload, Exception):
+            raise payload
+        return payload
+
+
+def test_exercise_sets_fetch_if_missing() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    domains.EXERCISE_SETS_SLEEP_S = 0
+    today = date.today()
+    recent = today - timedelta(days=3)
+    with psycopg.connect(DB_URL) as conn:
+        for aid, kind, started in ((10, "strength_training", recent), (11, "strength_training", recent),
+                                   (12, "strength_training", recent), (13, "running", recent),
+                                   (14, "strength_training", today - timedelta(days=45))):
+            conn.execute("insert into activities (activity_id, raw, started_at) values (%s, %s, %s)",
+                         (aid, json.dumps({"activityType": {"typeKey": kind}}), started))
+        conn.commit()
+        stub = _SetsStub({10: SAMPLE_EXERCISE_SETS, 11: {"activityId": 11, "exerciseSets": None},
+                          12: RuntimeError("garmin 500")})
+        assert domains._sync_exercise_sets(conn, stub, today) == 1
+        assert sorted(stub.calls) == [10, 11, 12], "only recent strength activities without a row"
+        stored = [r[0] for r in conn.execute("select activity_id from activity_exercise_sets").fetchall()]
+        assert stored == [10], "null payloads and errors store nothing (retried next sync)"
+        stub.calls.clear()
+        domains._sync_exercise_sets(conn, stub, today)
+        assert sorted(stub.calls) == [11, 12], "stored activities are not refetched"
+    print("test_exercise_sets_fetch_if_missing: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -715,6 +756,7 @@ def main() -> None:
     test_coach_tables_are_self_describing()
     test_strength_schema_and_view()
     test_exercise_catalog_refresh_keeps_rows_on_failure()
+    test_exercise_sets_fetch_if_missing()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 
