@@ -86,6 +86,13 @@ def apply_coach_grants(conn: psycopg.Connection, roles: CoachLoopRoles) -> None:
         if t not in COACH_DENIED_TABLES:
             ex("grant select on {t} to {r}", t=sql.Identifier(t), r=coach)
 
+    # Views aren't in pg_tables; grant them read access the same way
+    # (e.g. activity_exercise_set_rows). The coach may read every view.
+    views = [r[0] for r in conn.execute("select viewname from pg_views where schemaname = 'public'").fetchall()]
+    for v in views:
+        ex("grant select on {t} to {r}", t=sql.Identifier(v), r=sched)
+        ex("grant select on {t} to {r}", t=sql.Identifier(v), r=coach)
+
     ex("grant insert, update, delete on protocols to {r}", r=coach)
     ex("grant insert ({c}), update ({c}) on training_plan to {r}", c=_cols(COACH_PLAN_COLUMNS), r=coach)
     ex("grant delete on training_plan to {r}", r=coach)
@@ -103,6 +110,8 @@ def apply_coach_grants(conn: psycopg.Connection, roles: CoachLoopRoles) -> None:
         for t in tables:
             if t != "auth_tokens":
                 ex("grant select on {t} to {r}", t=sql.Identifier(t), r=sql.Identifier(roles.read))
+        for v in views:
+            ex("grant select on {t} to {r}", t=sql.Identifier(v), r=sql.Identifier(roles.read))
 
 
 def assert_role_isolated(conn: psycopg.Connection, role: str) -> None:

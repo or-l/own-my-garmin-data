@@ -212,6 +212,38 @@ make the coach exceed its grants.
   workouts is skipped, never guessed — many catalog names repeat (e.g.
   "Drill Workout"), so prefer `workout_id`.
 
+### Strength workouts
+
+Besides `kind='other'` (hangboard/interval), the coach can generate guided
+Garmin **Strength** workouts with `kind='strength'`:
+
+```json
+{"warmup": "lap",
+ "exercises": [
+   {"category": "PULL_UP", "exercise": "WEIGHTED_PULL_UP", "sets": 4, "reps": 3, "weight_kg": 10, "rest_s": 180, "note": "full lockout"},
+   {"category": "PLANK", "exercise": "PLANK", "sets": 3, "time_s": 45}]}
+```
+
+Each exercise: `category` + `exercise` from `exercise_catalog` (required),
+`sets` ≥ 1, exactly one of `reps` / `time_s`, optional `weight_kg`,
+`rest_s` in seconds (omit = rest until the lap button), and a `note` of up
+to 50 characters shown on the watch (use "L"/"R" with two consecutive
+entries for per-side work). No supersets or pyramids yet.
+
+- Exercise names come from `exercise_catalog` (Garmin's public catalogue,
+  refreshed weekly by the `workouts` sync). The seed refuses any protocol
+  with an unknown (category, exercise) pair or a malformed exercise, and
+  says why in its output.
+- After a strength session and a sync, `activity_exercise_set_rows` has one
+  row per set (reps, `weight_kg`, duration, detected exercise). Weights
+  arrive from Garmin in grams and are converted to kg.
+
+Add this to the coach's Project instructions:
+
+```
+Strength sessions: don't reuse a library workout unless it genuinely matches. Generate one: INSERT a protocols row with kind='strength' (format in the protocols table description), taking every (category, exercise) from exercise_catalog, then plan it with source='generated'. After the session, read activity_exercise_set_rows (reps, weight_kg per set) to set the next session's load and reps.
+```
+
 ### The order things happen in
 
 1. Ingestion syncs your library and calendar (the `workouts` domain).

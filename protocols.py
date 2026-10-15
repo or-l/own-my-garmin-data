@@ -47,3 +47,33 @@ def seed_default_protocols(conn: psycopg.Connection) -> int:
             (slug, p["name"], p["description"], p["kind"], json.dumps(p["params"])),
         )
     return len(DEFAULT_PROTOCOLS)
+
+
+def strength_problems(conn: psycopg.Connection, params: dict) -> list[str]:
+    """(category, exercise) pairs Garmin won't accept, checked against the
+    synced exercise_catalog. An empty catalogue refuses everything rather
+    than letting an unvalidated payload reach Garmin."""
+    pairs = [(e.get("category"), e.get("exercise")) for e in (params or {}).get("exercises") or [] if isinstance(e, dict)]
+    if not pairs:
+        return []
+    if not conn.execute("select exists (select 1 from exercise_catalog)").fetchone()[0]:
+        return ["exercise catalogue not synced yet — run a pull with the workouts domain enabled"]
+    known = set(conn.execute(
+        "select category, exercise from exercise_catalog where category = any(%s)",
+        (sorted({c for c, _ in pairs if c}),),
+    ).fetchall())
+    return [f"{c}/{e} is not in Garmin's exercise catalogue (see exercise_catalog)"
+            for c, e in pairs if (c, e) not in known]
+
+
+def protocol_problems(conn: psycopg.Connection, kind: str, name: str, description: str | None, params: dict) -> list[str]:
+    """Everything that would stop this protocol uploading cleanly, found
+    before any Garmin call: shape errors from the builder, then (strength)
+    the catalogue check."""
+    try:
+        build(kind, name, description, params)
+    except Exception as e:  # any bad input (incl. OverflowError on absurd numbers) is a note, never a crash
+        return [f"{type(e).__name__}: {e}" if not isinstance(e, ValueError) else str(e)]
+    if kind == "strength":
+        return strength_problems(conn, params)
+    return []

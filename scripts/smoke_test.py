@@ -35,10 +35,12 @@ real migrations — see that plan's "Out of scope" section; not covered
 here on purpose.
 """
 import contextlib
+import json
 import os
 import pathlib
 import sys
 from datetime import date, timedelta
+from decimal import Decimal
 
 import psycopg
 
@@ -57,6 +59,17 @@ from protocols import seed_default_protocols
 
 DB_URL = os.environ["SMOKE_TEST_DATABASE_URL"]
 OLD_INIT_SQL = pathlib.Path(__file__).resolve().parent.parent / "schema" / "init.sql"
+
+
+def _fake_catalog_doc() -> dict:
+    return {"categories": {
+        "PULL_UP": {"exercises": {"WEIGHTED_PULL_UP": {"primaryMuscles": ["LATS"]}, "PULL_UP": {}}},
+        "PLANK": {"exercises": {"PLANK": {}}},
+        "ROW": {"exercises": {"DUMBBELL_ROW": {}}},
+    }}
+
+
+domains._fetch_catalog_doc = _fake_catalog_doc
 
 
 def _reset_db(conn: psycopg.Connection) -> None:
@@ -203,6 +216,9 @@ class _WorkoutsStub:
 
     def get_scheduled_workouts(self, year, month):
         return {"calendarItems": []}
+
+    def get_activity_exercise_sets(self, activity_id):
+        return None
 
 
 def test_workouts_domain_tables_and_join() -> None:
@@ -629,6 +645,196 @@ def test_coach_tables_are_self_describing() -> None:
     print("test_coach_tables_are_self_describing: PASS")
 
 
+SAMPLE_EXERCISE_SETS = {"activityId": 1, "exerciseSets": [
+    {"setType": "ACTIVE", "repetitionCount": 5, "weight": 12500.0, "duration": 42.7, "startTime": "2026-10-01T18:56:17.0",
+     "exercises": [{"category": "UNKNOWN", "name": None, "probability": 0.0},
+                   {"category": "BENCH_PRESS", "name": "DUMBBELL_BENCH_PRESS", "probability": 99.6}]},
+    {"setType": "REST", "repetitionCount": None, "weight": None, "duration": 120.0, "startTime": "2026-10-01T18:57:00.0",
+     "exercises": []},
+]}
+
+
+def test_strength_schema_and_view() -> None:
+    coach_url, _sched_url = _setup_coach_loop()
+    with psycopg.connect(DB_URL) as conn:
+        for t in ("exercise_catalog", "activity_exercise_sets"):
+            assert _table_exists(conn, t), t
+        conn.execute("insert into activity_exercise_sets (activity_id, raw) values (1, %s), (2, %s)",
+                     (json.dumps(SAMPLE_EXERCISE_SETS), json.dumps({"activityId": 2, "exerciseSets": None})))
+        conn.commit()
+        for t in ("exercise_catalog", "activity_exercise_sets", "activity_exercise_set_rows"):
+            desc = conn.execute("select obj_description(%s::regclass, 'pg_class')", (t,)).fetchone()[0] or ""
+            assert "READ-ONLY" in desc, t
+    with psycopg.connect(coach_url) as conn:  # views need their own grant (pg_tables excludes them)
+        rows = conn.execute(
+            "select set_index, set_type, reps, weight_kg, duration_s, category, exercise, probability "
+            "from activity_exercise_set_rows order by activity_id, set_index").fetchall()
+    assert rows == [
+        (0, "ACTIVE", 5, Decimal("12.5"), Decimal("42.7"), "BENCH_PRESS", "DUMBBELL_BENCH_PRESS", Decimal("99.6")),
+        (1, "REST", None, None, Decimal("120.0"), None, None, None),
+    ], rows
+    print("test_strength_schema_and_view: PASS")
+
+
+def test_exercise_catalog_refresh_keeps_rows_on_failure() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    sample = json.loads((pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+                         / "exercise_catalog_sample.json").read_text())
+    today = date.today()
+    with psycopg.connect(DB_URL) as conn:
+        domains._fetch_catalog_doc = lambda: sample
+        assert domains._refresh_exercise_catalog(conn, today) == 3
+        assert domains._refresh_exercise_catalog(conn, today) == 0, "fresh catalogue must not refetch"
+        conn.execute("update exercise_catalog set synced_at = now() - interval '8 days'")
+        conn.commit()
+
+        def boom():
+            raise OSError("network down")
+        for failing in (boom, lambda: {"html": "<b>oops</b>"}, lambda: {}):
+            domains._fetch_catalog_doc = failing
+            assert domains._refresh_exercise_catalog(conn, today) == 0
+            assert conn.execute("select count(*) from exercise_catalog").fetchone()[0] == 3, "rows must survive"
+    domains._fetch_catalog_doc = _fake_catalog_doc
+    print("test_exercise_catalog_refresh_keeps_rows_on_failure: PASS")
+
+
+class _SetsStub:
+    def __init__(self, payloads: dict):
+        self.payloads, self.calls = payloads, []
+
+    def get_activity_exercise_sets(self, activity_id):
+        self.calls.append(activity_id)
+        payload = self.payloads.get(activity_id)
+        if isinstance(payload, Exception):
+            raise payload
+        return payload
+
+
+def test_exercise_sets_fetch_if_missing() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    domains.EXERCISE_SETS_SLEEP_S = 0
+    today = date.today()
+    recent = today - timedelta(days=3)
+    with psycopg.connect(DB_URL) as conn:
+        for aid, kind, started in ((10, "strength_training", recent), (11, "strength_training", recent),
+                                   (12, "strength_training", recent), (13, "running", recent),
+                                   (14, "strength_training", today - timedelta(days=45))):
+            conn.execute("insert into activities (activity_id, raw, started_at) values (%s, %s, %s)",
+                         (aid, json.dumps({"activityType": {"typeKey": kind}}), started))
+        conn.commit()
+        stub = _SetsStub({10: SAMPLE_EXERCISE_SETS, 11: {"activityId": 11, "exerciseSets": None},
+                          12: RuntimeError("garmin 500")})
+        assert domains._sync_exercise_sets(conn, stub, today) == 1
+        assert sorted(stub.calls) == [10, 11, 12], "only recent strength activities without a row"
+        stored = [r[0] for r in conn.execute("select activity_id from activity_exercise_sets").fetchall()]
+        assert stored == [10], "null payloads and errors store nothing (retried next sync)"
+        stub.calls.clear()
+        domains._sync_exercise_sets(conn, stub, today)
+        assert sorted(stub.calls) == [11, 12], "stored activities are not refetched"
+    print("test_exercise_sets_fetch_if_missing: PASS")
+
+
+def test_seed_validates_strength_protocols() -> None:
+    import plan_admin
+    coach_url, sched_url = _setup_coach_loop()
+    seed_workouts.POLITENESS_SLEEP_S = 0
+    tomorrow = date.today() + timedelta(days=1)
+    good = {"exercises": [{"category": "PULL_UP", "exercise": "WEIGHTED_PULL_UP", "sets": 4, "reps": 3, "weight_kg": 10, "rest_s": 180}]}
+    bad_pair = {"exercises": [{"category": "ROW", "exercise": "PULL_UP", "sets": 3, "reps": 5}]}
+    bad_shape = {"exercises": [{"category": "PULL_UP", "exercise": "PULL_UP", "sets": 3, "reps": 5, "weight": 10}]}
+    with psycopg.connect(DB_URL) as conn:  # catalogue as ingestion would have it
+        conn.execute("insert into exercise_catalog (category, exercise) values ('PULL_UP','WEIGHTED_PULL_UP'), ('PULL_UP','PULL_UP')")
+        conn.commit()
+    with psycopg.connect(coach_url) as conn:
+        ids = []
+        for slug, params, day in (("s-good", good, tomorrow), ("s-pair", bad_pair, tomorrow + timedelta(days=1)),
+                                  ("s-shape", bad_shape, tomorrow + timedelta(days=2))):
+            conn.execute("insert into protocols (slug, name, kind, params) values (%s, %s, 'strength', %s)",
+                         (slug, slug, json.dumps(params)))
+            ids.append(conn.execute(
+                "insert into training_plan (scheduled_date, source, protocol_slug) values (%s, 'generated', %s) returning id",
+                (day, slug)).fetchone()[0])
+    with psycopg.connect(DB_URL) as conn:
+        plan_admin.approve(conn, ids, None)
+    with psycopg.connect(sched_url) as conn:
+        actions, notes = seed_workouts.plan_seed(conn, date.today())
+        assert [a.slug for a in actions] == ["s-good"], actions
+        joined = " | ".join(notes)
+        assert "s-pair" in joined and "ROW/PULL_UP" in joined, notes
+        assert "s-shape" in joined and "weight" in joined, notes
+        fake = FakeGarmin()
+        seed_workouts.run(conn, lambda: contextlib.nullcontext(fake), today=date.today(), confirm=_yes)
+    assert len(fake.uploads) == 1
+    uploaded = fake.library[fake.uploads[0]]
+    assert uploaded["sportType"]["sportTypeKey"] == "strength_training"
+    ex = uploaded["workoutSegments"][0]["workoutSteps"][1]["workoutSteps"][0]
+    assert (ex["exerciseName"], ex["weightValue"]) == ("WEIGHTED_PULL_UP", 10.0)
+
+    with psycopg.connect(DB_URL) as conn:  # empty catalogue -> refuse every strength protocol
+        conn.execute("delete from exercise_catalog")
+        conn.execute("delete from generated_workouts")
+        conn.commit()
+    with psycopg.connect(sched_url) as conn:
+        actions, notes = seed_workouts.plan_seed(conn, date.today())
+    assert actions == [] and any("not synced" in n for n in notes), notes
+    print("test_seed_validates_strength_protocols: PASS")
+
+
+def test_view_survives_malformed_sets() -> None:
+    """One odd set must not break every coach query on the view."""
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    odd = {"exerciseSets": [
+        {"setType": "ACTIVE", "repetitionCount": 5.0, "weight": "heavy", "duration": "x", "startTime": "not a time",
+         "exercises": {"category": "PULL_UP"}},
+        {"setType": "ACTIVE", "repetitionCount": 6, "weight": 10000.0, "duration": 30.0, "startTime": "2026-10-01T18:56:17.0",
+         "exercises": [{"category": "PULL_UP", "name": "PULL_UP", "probability": "high"}]},
+    ]}
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("insert into activity_exercise_sets (activity_id, raw) values (7, %s)", (json.dumps(odd),))
+        rows = conn.execute("select set_index, reps, weight_kg, duration_s, start_time_utc, category, exercise, probability "
+                            "from activity_exercise_set_rows order by set_index").fetchall()
+    assert rows[0] == (0, 5, None, None, None, None, None, None), rows
+    assert rows[1][:3] == (1, 6, Decimal("10.0")) and rows[1][5:] == ("PULL_UP", "PULL_UP", None), rows
+    print("test_view_survives_malformed_sets: PASS")
+
+
+def test_workouts_sync_before_strength_migration() -> None:
+    """Code merged before 0011 is applied: the daily sync must still run."""
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("drop view activity_exercise_set_rows; drop table exercise_catalog; drop table activity_exercise_sets")
+        conn.commit()
+        ctx = SyncContext(client=_WorkoutsStub([{"workoutId": 42, "updateDate": "u1"}]), conn=conn,
+                          window_start=date.today(), today=date.today())
+        counts = domains._workouts_sync(ctx)
+        assert counts["exercise_catalog"] == 0 and counts["activity_exercise_sets"] == 0, counts
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "ingestion"))
+        import pull
+        assert pull.table_count(conn, "exercise_catalog") == 0
+    print("test_workouts_sync_before_strength_migration: PASS")
+
+
+def test_exercise_sets_ignores_non_dict_payload() -> None:
+    with psycopg.connect(DB_URL) as conn:
+        _reset_db(conn)
+    apply_migrations(DB_URL, enabled_domains={"activities", "workouts"})
+    domains.EXERCISE_SETS_SLEEP_S = 0
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute("insert into activities (activity_id, raw, started_at) values (20, %s, now())",
+                     (json.dumps({"activityType": {"typeKey": "strength_training"}}),))
+        conn.commit()
+        assert domains._sync_exercise_sets(conn, _SetsStub({20: [{"setType": "ACTIVE"}]}), date.today()) == 0
+    print("test_exercise_sets_ignores_non_dict_payload: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -645,6 +851,13 @@ def main() -> None:
     test_review_fixes()
     test_read_only_install_has_no_coach_config()
     test_coach_tables_are_self_describing()
+    test_strength_schema_and_view()
+    test_exercise_catalog_refresh_keeps_rows_on_failure()
+    test_exercise_sets_fetch_if_missing()
+    test_seed_validates_strength_protocols()
+    test_view_survives_malformed_sets()
+    test_workouts_sync_before_strength_migration()
+    test_exercise_sets_ignores_non_dict_payload()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 

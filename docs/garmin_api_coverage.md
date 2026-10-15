@@ -80,6 +80,8 @@ sessions if a shape ever needs re-checking against a live account.
 | `get_workouts` | `workouts` (workouts domain) — paged list; its `updateDate` is the change marker (the detail endpoint calls it `updatedDate`), so unchanged workouts aren't re-expanded. An empty listing never wipes the table. |
 | `get_workout_by_id` | `workouts.raw` — the full workout (steps + description) for each new/changed workout. Join: `activities.raw->>'workoutId'`. |
 | `get_scheduled_workouts` | `scheduled_workouts` — called per month with a **1-based** month (the library converts). Each response is the whole calendar grid, including neighbouring-month days and non-workout items, so items are filtered to `itemType = 'workout'` and deduped by `id` (which equals `workoutScheduleId`, verified 2026-09-30). Window: start of this month → +62 days. |
+| `get_activity_exercise_sets` | `activity_exercise_sets` (workouts domain) — per-set results of `strength_training` activities started in the last 30 days, fetch-if-missing (an empty/None `exerciseSets` stores nothing and is retried). `weight` is in **grams** (verified: `maxWeight` 12500 shows as 12.5 kg in the app); the `activity_exercise_set_rows` view flattens one row per set with `weight_kg`. |
+| *(not a `Garmin` method)* `https://connect.garmin.com/web-data/exercises/Exercises.json` | `exercise_catalog` (workouts domain) — Garmin's public, unauthenticated exercise catalogue (47 categories / 1531 exercises with muscles), fetched with stdlib `urllib` at most every 7 days; a failed or empty fetch keeps the existing rows. `kind='strength'` protocols are validated against it at seed time. |
 
 ## Investigated, deliberately not used (duplicates)
 
@@ -106,7 +108,7 @@ described in this project's task notes, since it's one call per activity,
 not per date): `get_activity`, `get_activity_details`, `get_activity_splits`,
 `get_activity_split_summaries`, `get_activity_typed_splits`,
 `get_activity_weather`, `get_activity_hr_in_timezones`,
-`get_activity_power_in_timezones`, `get_activity_exercise_sets`,
+`get_activity_power_in_timezones`,
 `get_activity_gear`, `get_activities`, `get_activities_fordate`,
 `get_last_activity`, `count_activities`, `download_activity`, `download`.
 
@@ -146,7 +148,7 @@ coach loop use): `get_scheduled_workout_by_id`,
 `get_stats_and_body`, `get_stress_data`, `get_weekly_steps`,
 `query_garmin_graphql`, `request_reload`.
 
-**Write operations**: ingestion is read-only; the only writes are
+**Write operations** (`upload_strength_workout` is deliberately unused: strength workouts are uploaded as our own verified payload via `upload_workout`): ingestion is read-only; the only writes are
 `upload_workout`, `schedule_workout`, `unschedule_workout` and
 `delete_workout`, confined to `garmin_write.py` (an AST test enforces it)
 and used only by the manual, approval-gated coach loop (see README).

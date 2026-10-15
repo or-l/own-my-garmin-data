@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Callable
@@ -465,6 +466,113 @@ def _replace_scheduled(conn: psycopg.Connection, items: dict[int, dict], window:
         )
 
 
+CATALOG_URL = "https://connect.garmin.com/web-data/exercises/Exercises.json"
+CATALOG_MAX_AGE_DAYS = 7
+
+
+def parse_exercise_catalog(doc: dict | None) -> list[tuple[str, str, list[str], list[str], str | None]]:
+    """Garmin's {"categories": {CAT: {"exercises": {NAME: {...}}}}} -> rows,
+    sorted by (category, exercise). Tolerates missing/empty pieces."""
+    rows = []
+    categories = (doc or {}).get("categories") if isinstance(doc, dict) else None
+    for category, body in sorted((categories or {}).items()):
+        exercises = (body or {}).get("exercises") if isinstance(body, dict) else None
+        for exercise, info in sorted((exercises or {}).items()) if isinstance(exercises, dict) else []:
+            info = info if isinstance(info, dict) else {}
+            counterpart = info.get("counterpart")
+            rows.append((category, exercise, _str_list(info.get("primaryMuscles")),
+                         _str_list(info.get("secondaryMuscles")),
+                         counterpart if isinstance(counterpart, str) else None))
+    return rows
+
+
+def _str_list(value) -> list[str]:
+    """Muscle lists as Garmin should send them; anything else (a bare string,
+    numbers, objects) is dropped rather than stored wrong."""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _fetch_catalog_doc() -> dict:
+    """Public, unauthenticated static file the Connect web app loads.
+    stdlib only: the ingestion runner has no `requests`."""
+    req = urllib.request.Request(CATALOG_URL, headers={"User-Agent": "garmin-data"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+
+
+def _table_exists(conn: psycopg.Connection, table: str) -> bool:
+    return conn.execute("select to_regclass(%s)", (table,)).fetchone()[0] is not None
+
+
+def _refresh_exercise_catalog(conn: psycopg.Connection, today: date) -> int:
+    if not _table_exists(conn, "exercise_catalog"):
+        return 0  # code deployed before migration 0011 — run install.py --upgrade
+    last = conn.execute("select max(synced_at) from exercise_catalog").fetchone()[0]
+    if last is not None and last.date() > today - timedelta(days=CATALOG_MAX_AGE_DAYS):
+        return 0
+    try:
+        rows = parse_exercise_catalog(_fetch_catalog_doc())
+    except Exception as e:  # network, HTTP, bad JSON — keep what we have
+        print(f"exercise catalog: fetch failed, keeping existing rows ({e})")
+        return 0
+    if not rows:
+        print("exercise catalog: empty/unrecognised response, keeping existing rows")
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            insert into exercise_catalog (category, exercise, primary_muscles, secondary_muscles, counterpart, synced_at)
+            values (%s, %s, %s, %s, %s, now())
+                on conflict (category, exercise) do update set
+                primary_muscles = excluded.primary_muscles, secondary_muscles = excluded.secondary_muscles,
+                counterpart = excluded.counterpart, synced_at = now()
+            """,
+            rows,
+        )
+    conn.commit()
+    return len(rows)
+
+EXERCISE_SETS_LOOKBACK_DAYS = 30
+EXERCISE_SETS_SLEEP_S = 1.0
+
+
+def _sync_exercise_sets(conn: psycopg.Connection, client, today: date) -> int:
+    """Fetch-if-missing: per-set results for recent strength activities that
+    don't have a row yet. An empty/None payload or an error stores nothing,
+    so the activity is retried on the next sync."""
+    if not (_table_exists(conn, "activities") and _table_exists(conn, "activity_exercise_sets")):
+        return 0  # activities domain off, or code deployed before migration 0011
+    ids = [r[0] for r in conn.execute(
+        """
+        select a.activity_id from activities a
+          left join activity_exercise_sets s on s.activity_id = a.activity_id
+         where s.activity_id is null
+           and a.raw->'activityType'->>'typeKey' = 'strength_training'
+           and a.started_at >= %s
+         order by a.started_at
+        """,
+        (today - timedelta(days=EXERCISE_SETS_LOOKBACK_DAYS),),
+    ).fetchall()]
+    stored = 0
+    for activity_id in ids:
+        try:
+            payload = client.get_activity_exercise_sets(activity_id)
+        except Exception as e:
+            print(f"exercise sets for activity {activity_id}: fetch failed, will retry ({e})")
+            payload = None
+        if isinstance(payload, dict) and payload.get("exerciseSets"):
+            conn.execute(
+                """
+                insert into activity_exercise_sets (activity_id, raw, synced_at) values (%s, %s, now())
+                    on conflict (activity_id) do update set raw = excluded.raw, synced_at = now()
+                """,
+                (activity_id, json.dumps(payload)),
+            )
+            conn.commit()
+            stored += 1
+        time.sleep(EXERCISE_SETS_SLEEP_S)
+    return stored
+
 def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
     listing = _fetch_workout_list(ctx.client)
     stored = dict(ctx.conn.execute("select workout_id, updated_date from workouts").fetchall())
@@ -490,7 +598,10 @@ def _workouts_sync(ctx: SyncContext) -> dict[str, int]:
     scheduled = _fetch_scheduled(ctx.client, ctx.today, end)
     _replace_scheduled(ctx.conn, scheduled, month_window(ctx.today, end))
     ctx.conn.commit()
-    return {"workouts": len(listing), "scheduled_workouts": len(scheduled)}
+    catalog = _refresh_exercise_catalog(ctx.conn, ctx.today)
+    sets = _sync_exercise_sets(ctx.conn, ctx.client, ctx.today)
+    return {"workouts": len(listing), "scheduled_workouts": len(scheduled),
+            "exercise_catalog": catalog, "activity_exercise_sets": sets}
 
 
 # --------------------------------------------------------------------- registry
@@ -536,7 +647,7 @@ DOMAINS: list[Domain] = [
         key="workouts", category="Workouts", label="Workout library & calendar",
         description="Your workout library (fully expanded steps + description) and workouts scheduled on your Garmin calendar. Read-only.",
         default_enabled=False, sync_incremental=_workouts_sync, backfill=None,
-        tables=("workouts", "scheduled_workouts"),
+        tables=("workouts", "scheduled_workouts", "exercise_catalog", "activity_exercise_sets"),
     ),
     # "reproductive" (menstrual calendar, pregnancy summary) is deliberately
     # not registered here yet — its endpoints haven't been verified live.

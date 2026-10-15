@@ -47,4 +47,4 @@ def test_month_window():
 def test_workouts_domain_registered_off_by_default():
     d = domains.DOMAINS_BY_KEY["workouts"]
     assert d.default_enabled is False and d.backfill is None
-    assert d.tables == ("workouts", "scheduled_workouts")
+    assert d.tables == ("workouts", "scheduled_workouts", "exercise_catalog", "activity_exercise_sets")

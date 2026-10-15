@@ -17,9 +17,23 @@ def test_build_dispatches_on_kind():
 
 
 def test_unknown_kind_is_a_clear_error():
-    with pytest.raises(ValueError, match="strength"):
-        build("strength", "x", None, {})
+    with pytest.raises(ValueError, match="running"):
+        build("running", "x", None, {})
 
 
 def test_defaults_are_single_set_until_multiset_verified():
     assert all(p["params"].get("sets", 1) == 1 for p in DEFAULT_PROTOCOLS.values())
+
+
+def test_strength_builds_through_dispatch():
+    params = {"exercises": [{"category": "PLANK", "exercise": "PLANK", "sets": 3, "time_s": 45}]}
+    w = build("strength", "Core", "plank day", params)
+    assert w["sportType"]["sportTypeKey"] == "strength_training" and w["workoutName"] == "Core"
+
+
+def test_protocol_problems_never_raises_on_absurd_numbers():
+    # 10**400 is valid jsonb and loads as a Python int; float() of it overflows.
+    from protocols import protocol_problems
+    params = {"exercises": [{"category": "PULL_UP", "exercise": "PULL_UP", "sets": 10**400, "reps": 5}]}
+    problems = protocol_problems(None, "strength", "x", None, params)
+    assert problems and isinstance(problems[0], str)

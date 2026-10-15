@@ -56,6 +56,11 @@ LOOKBACK_DAYS = 5
 
 
 def table_count(conn: psycopg.Connection, table: str) -> int:
+    # A table can be missing when the code is newer than the schema (e.g.
+    # merged before `install.py --upgrade` applied its migration): count 0
+    # instead of failing the whole sync.
+    if conn.execute("select to_regclass(%s)", (table,)).fetchone()[0] is None:
+        return 0
     return conn.execute(f"select count(*) from {table}").fetchone()[0]  # noqa: S608 (fixed table names, not user input)
 
 

@@ -13,9 +13,8 @@ sets > 1 is UNVERIFIED: it emits `sets` sibling repeat groups separated by
 a timed rest step. No hand-built multi-set workout has been reflected yet
 to confirm Garmin's shape (plan Task 0).
 
-BUILDERS is the `kind` seam protocols.build() dispatches on. Only "other"
-exists; tier-1 kinds (strength etc.) are reached through the `library`
-plan source instead of a generator.
+BUILDERS is the `kind` seam protocols.build() dispatches on: "other"
+(interval workouts) and "strength" (see the strength section below).
 """
 from __future__ import annotations
 
@@ -172,4 +171,188 @@ def make_other_workout(
     }
 
 
-BUILDERS: dict[str, Callable[..., dict]] = {"other": make_other_workout}
+# ------------------------------------------------------------------ strength
+# Garmin "Strength" workouts. Every id and key below was copied from
+# workouts hand-built in Garmin Connect and reflected via get_workout_by_id:
+# the "testing workout for coaching" reference (weighted reps, timed hold,
+# lap-button rests, CARDIO warm-up; tests/fixtures/strength_reference.json)
+# and Bear Essentials (timed rests; tests/fixtures/bear_essentials.json).
+# tests/test_workout_gen_strength.py pins both field for field.
+#
+# One repeat group per exercise: (exercise step, rest step) x sets. Per-side
+# work is two consecutive exercises with note "L"/"R" — Garmin has no
+# left/right flag. Exercise names must come from Garmin's catalogue; that's
+# checked against exercise_catalog at seed time, not here (this stays pure).
+
+SPORT_STRENGTH = {"sportTypeId": 5, "sportTypeKey": "strength_training", "displayOrder": 3}
+_REPS = {"conditionTypeId": 10, "conditionTypeKey": "reps", "displayOrder": 10, "displayable": True}
+_KILOGRAM = {"unitId": 8, "unitKey": "kilogram", "factor": 1000.0}
+_KILOMETER = {"unitId": 2, "unitKey": "kilometer", "factor": 100000.0}
+
+STRENGTH_EXERCISE_KEYS = frozenset({"category", "exercise", "sets", "reps", "time_s", "weight_kg", "rest_s", "note"})
+_NOTE_MAX = 50
+
+
+def _strength_step(order: int, step_type: str, *, child: int | None, category: str | None,
+                   exercise: str | None, condition: dict, value: float, weight_kg: float | None = None,
+                   description: str | None = None, preferred_unit: dict | None = None) -> dict:
+    return {
+        "type": "ExecutableStepDTO",
+        "stepOrder": order,
+        "stepType": dict(_STEP_TYPES[step_type]),
+        "childStepId": child,
+        "description": description,
+        "endCondition": dict(condition),
+        "endConditionValue": float(value),
+        "preferredEndConditionUnit": dict(preferred_unit) if preferred_unit else None,
+        "endConditionCompare": None,
+        "targetType": dict(_NO_TARGET),
+        "targetValueOne": None,
+        "targetValueTwo": 0.0,
+        "targetValueUnit": None,
+        "zoneNumber": None,
+        "secondaryTargetType": None,
+        "secondaryTargetValueOne": None,
+        "secondaryTargetValueTwo": None,
+        "secondaryTargetValueUnit": None,
+        "secondaryZoneNumber": None,
+        "endConditionZone": None,
+        "strokeType": dict(_NO_STROKE),
+        "equipmentType": dict(_NO_EQUIPMENT),
+        "category": category,
+        "exerciseName": exercise,
+        "workoutProvider": None,
+        "providerExerciseSourceId": None,
+        "weightValue": float(weight_kg) if weight_kg is not None else None,
+        "weightUnit": dict(_KILOGRAM),
+    }
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_strength(exercises, warmup) -> None:
+    if warmup not in ("lap", None):
+        raise ValueError(f"warmup must be \"lap\" or null (got {warmup!r})")
+    if not isinstance(exercises, list) or not exercises:
+        raise ValueError("a strength protocol needs at least one exercise")
+    for i, ex in enumerate(exercises, 1):
+        where = f"exercise {i}"
+        if not isinstance(ex, dict):
+            raise ValueError(f"{where}: must be an object")
+        unknown = set(ex) - STRENGTH_EXERCISE_KEYS
+        if unknown:
+            raise ValueError(f"{where}: unknown key(s) {sorted(unknown)}; allowed: {sorted(STRENGTH_EXERCISE_KEYS)}")
+        for key in ("category", "exercise"):
+            if not isinstance(ex.get(key), str) or not ex[key].strip():
+                raise ValueError(f"{where}: {key} must be a non-empty Garmin catalogue name")
+        if not isinstance(ex.get("sets"), int) or isinstance(ex.get("sets"), bool) or ex["sets"] < 1:
+            raise ValueError(f"{where}: sets must be an integer >= 1")
+        has_reps, has_time = ex.get("reps") is not None, ex.get("time_s") is not None
+        if has_reps == has_time:
+            raise ValueError(f"{where}: give exactly one of reps / time_s")
+        if has_reps and (not isinstance(ex["reps"], int) or isinstance(ex["reps"], bool) or ex["reps"] < 1):
+            raise ValueError(f"{where}: reps must be an integer >= 1")
+        if has_time and (not _is_number(ex["time_s"]) or ex["time_s"] <= 0):
+            raise ValueError(f"{where}: time_s must be > 0 seconds")
+        for key in ("weight_kg", "rest_s"):
+            if ex.get(key) is not None and (not _is_number(ex[key]) or ex[key] <= 0):
+                raise ValueError(f"{where}: {key} must be > 0 (or omitted)")
+        note = ex.get("note")
+        if note is not None and (not isinstance(note, str) or len(note) > _NOTE_MAX):
+            raise ValueError(f"{where}: note must be text of at most {_NOTE_MAX} characters")
+
+
+def make_strength_workout(
+    name: str,
+    description: str | None = None,
+    *,
+    exercises: list[dict],
+    warmup: str | None = "lap",
+) -> dict:
+    _validate_strength(exercises, warmup)
+
+    steps: list[dict] = []
+    order = 0
+    if warmup == "lap":
+        order += 1
+        steps.append(_strength_step(order, "warmup", child=None, category="CARDIO", exercise="",
+                                    condition=_LAP_BUTTON, value=0.0))
+    for group_no, ex in enumerate(exercises, 1):
+        order += 1
+        group_order = order
+        order += 1
+        if ex.get("reps") is not None:
+            condition, value = _REPS, ex["reps"]
+        else:
+            condition, value = _TIME, ex["time_s"]
+        work = _strength_step(order, "interval", child=group_no, category=ex["category"], exercise=ex["exercise"],
+                              condition=condition, value=value, weight_kg=ex.get("weight_kg"),
+                              description=ex.get("note") or "", preferred_unit=_KILOMETER)
+        order += 1
+        rest_s = ex.get("rest_s")
+        rest = _strength_step(order, "rest", child=group_no, category=None, exercise=None,
+                              condition=_TIME if rest_s is not None else _LAP_BUTTON,
+                              value=rest_s if rest_s is not None else 0.0)
+        steps.append({
+            "type": "RepeatGroupDTO",
+            "stepOrder": group_order,
+            "stepType": dict(_STEP_TYPES["repeat"]),
+            "childStepId": group_no,
+            "numberOfIterations": ex["sets"],
+            "workoutSteps": [work, rest],
+            "endConditionValue": float(ex["sets"]),
+            "preferredEndConditionUnit": None,
+            "endConditionCompare": None,
+            "endCondition": dict(_ITERATIONS),
+            "skipLastRestStep": False,
+            "smartRepeat": False,
+        })
+
+    segment = {
+        "segmentOrder": 1,
+        "sportType": dict(SPORT_STRENGTH),
+        "poolLengthUnit": None,
+        "poolLength": None,
+        "avgTrainingSpeed": None,
+        "estimatedDurationInSecs": None,
+        "estimatedDistanceInMeters": None,
+        "estimatedDistanceUnit": None,
+        "estimateType": None,
+        "description": None,
+        "workoutSteps": steps,
+    }
+    return {
+        "workoutName": name,
+        "description": description,
+        "sportType": dict(SPORT_STRENGTH),
+        "subSportType": "GENERIC",
+        "trainingPlanId": None,
+        "sharedWithUsers": None,
+        "estimatedDurationInSecs": 0,
+        "estimatedDistanceInMeters": 0.0,
+        "workoutSegments": [segment],
+        "poolLength": None,
+        "poolLengthUnit": None,
+        "locale": None,
+        "workoutProvider": None,
+        "workoutSourceId": None,
+        "uploadTimestamp": None,
+        "atpPlanId": None,
+        "consumer": None,
+        "consumerName": None,
+        "consumerImageURL": None,
+        "consumerWebsiteURL": None,
+        "workoutNameI18nKey": None,
+        "descriptionI18nKey": None,
+        "avgTrainingSpeed": 0.0,
+        "estimateType": None,
+        "estimatedDistanceUnit": {"unitId": None, "unitKey": None, "factor": None},
+        "workoutThumbnailUrl": None,
+        "isSessionTransitionEnabled": None,
+        "shared": False,
+    }
+
+
+BUILDERS: dict[str, Callable[..., dict]] = {"other": make_other_workout, "strength": make_strength_workout}
