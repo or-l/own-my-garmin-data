@@ -17,8 +17,8 @@ def test_build_dispatches_on_kind():
 
 
 def test_unknown_kind_is_a_clear_error():
-    with pytest.raises(ValueError, match="strength"):
-        build("strength", "x", None, {})
+    with pytest.raises(ValueError, match="running"):
+        build("running", "x", None, {})
 
 
 def test_defaults_are_single_set_until_multiset_verified():
