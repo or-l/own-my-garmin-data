@@ -46,7 +46,7 @@ freestyle strength sessions log most sets as `UNKNOWN` or mis-guessed exercises.
   `exerciseSets[]` with `setType` (ACTIVE/REST), `repetitionCount`, `weight`, `duration`,
   `startTime`, `exercises[]` (category, name, probability). 22 sets for activity 24681964793.
   "Other" activities return `exerciseSets: null`. The activities list payload already carries a
-  per-category rollup (`summarizedExerciseSets`).
+  per-category rollup (`summarizedExerciseSets`). Weights are in grams (see §5).
 - Garmin has **no left/right flag** on a step; one-arm exercises are just names.
 
 ## Design
@@ -114,9 +114,11 @@ freestyle strength sessions log most sets as `UNKNOWN` or mis-guessed exercises.
   'strength_training'`) from the last 30 days with no row yet; politeness sleep between calls;
   an empty/None response stores nothing (retry next sync). No backfill beyond 30 days in v1.
 - A view `activity_exercise_set_rows` flattens `raw->'exerciseSets'` into one row per set
-  (activity_id, set index, set_type, reps, weight, duration_s, start_time, top exercise category /
-  name / probability) so the coach queries it with plain SQL. **Open item:** confirm the `weight`
-  unit with a real weighted set before documenting it (expected grams).
+  (activity_id, set index, set_type, reps, weight_kg, duration_s, start_time, top exercise category /
+  name / probability) so the coach queries it with plain SQL. `weight` arrives in **grams** —
+  verified 2026-10-15: `summarizedExerciseSets.maxWeight` 12500 shows as 12.5 kg in the Garmin
+  app and `volume` = reps × weight (21 × 12500 = 262500) — so the view exposes
+  `weight_kg = weight / 1000.0` (one decimal, matching the app).
 - Comments explain: join to `training_plan` via `activities`, ACTIVE vs REST, low-probability
   exercises = watch guessing.
 
@@ -151,7 +153,7 @@ coach: run_sql on activity_exercise_set_rows ⋈ activities ⋈ training_plan  �
 
 - Unit: field-for-field vs the reference fixture (stripped of ids/owner/name/date) and vs Bear
   Essentials for timed rests; shape validation errors; `BUILDERS["strength"]`; catalogue JSON
-  parsing; set-rows flattening logic.
+  parsing; set-rows flattening logic (incl. grams → kg).
 - Smoke (Docker Postgres): migration creates the tables/view/comments; catalogue upsert keeps rows
   on fetch failure; exercise-sets fetch-if-missing with a stub client; seed skips a protocol with an
   unknown exercise and uploads a valid one (fake Garmin).
