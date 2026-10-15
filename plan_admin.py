@@ -3,6 +3,7 @@
 # dependencies = [
 #     "psycopg[binary]>=3.3",
 #     "python-dotenv>=1.0",
+#     "questionary>=2.0",
 # ]
 # ///
 """
@@ -11,6 +12,8 @@ gate). Connects with your owner DATABASE_URL; the coach and scheduler roles
 can't write that table.
 
     uv run plan_admin.py list [--all]            # upcoming rows + approval state
+    uv run plan_admin.py approve                 # checklists: tick rows to approve,
+                                                 # then (optionally) rows to skip
     uv run plan_admin.py approve --id 12 --id 13 [--note "..."] [--yes]
     uv run plan_admin.py approve --date 2026-10-02
     uv run plan_admin.py unapprove --id 12       # alias: reject
@@ -73,6 +76,121 @@ def approve(conn: psycopg.Connection, plan_ids: list[int], note: str | None) -> 
     return approve_views(conn, preview(conn, plan_ids), note)
 
 
+def pending_rows(views: list[planning.PlanView], today: date) -> list[planning.PlanView]:
+    """Rows waiting on the owner: upcoming, not cancelled, and unapproved or
+    changed since approval (STALE)."""
+    return [v for v in views
+            if v.row.scheduled_date >= today and not v.row.skip and v.approval in ("unapproved", "stale")]
+
+
+def _num(value) -> str:
+    return f"{value:g}" if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+
+
+def _exercise_summary(ex: dict) -> str:
+    sets = _num(ex.get("sets"))
+    target = f"{sets}×{_num(ex['reps'])}" if ex.get("reps") is not None else f"{sets}×{_num(ex.get('time_s'))}s"
+    weight = f" @{_num(ex['weight_kg'])}kg" if ex.get("weight_kg") is not None else ""
+    return f"{ex.get('exercise')} {target}{weight}"
+
+
+def _summary(v: planning.PlanView) -> str:
+    r = v.row
+    if r.source != "generated":
+        return f"{v.library_name or r.workout_name or f'workout {r.workout_id}'} (library)"
+    p = v.protocol or {}
+    name, params = p.get("name") or r.protocol_slug, p.get("params") or {}
+    try:
+        if p.get("kind") == "strength":
+            exercises = params.get("exercises") or []
+            shown = ", ".join(_exercise_summary(e) for e in exercises[:2])
+            more = ", …" if len(exercises) > 2 else ""
+            return f"{name} — {len(exercises)} exercises ({shown}{more})"
+        if p.get("kind") == "other":
+            return f"{name} — {_num(params.get('work_s'))}s on / {_num(params.get('rest_s'))}s off ×{_num(params.get('reps'))}"
+    except (AttributeError, KeyError, TypeError):
+        pass  # odd params: fall back to the name; the seed reports what's wrong
+    return name
+
+
+def label(v: planning.PlanView) -> str:
+    """One readable checklist line: id, day, STALE marker, short summary."""
+    stale = "STALE " if v.approval == "stale" else ""
+    return f"{v.row.id:>3}  {v.row.scheduled_date.strftime('%a %d %b')}  {stale}{_summary(v)}"
+
+
+def skip_rows(conn: psycopg.Connection, plan_ids: list[int]) -> int:
+    """Cancel rows (skip = true). The next enact removes any that are
+    already on the Garmin calendar."""
+    n = conn.execute("update training_plan set skip = true where id = any(%s::bigint[])", (list(plan_ids),)).rowcount
+    conn.commit()
+    return n
+
+
+def review(conn: psycopg.Connection, ask_approve, ask_skip, confirm, *, today: date | None = None,
+           note: str | None = None) -> str:
+    """Two checklists: rows to approve, then (of the rest) rows to skip;
+    everything unticked is left as it is. Nothing is written until confirm()
+    agrees to the summary. Approvals pin the versions that were listed, so a
+    coach edit made while the checklist is open shows up as STALE."""
+    today = today or date.today()
+    views = pending_rows(planning.load_plan(conn, since=today), today)
+    if not views:
+        print("Nothing waiting for approval.")
+        return ""
+    choices = [(label(v), v.row.id) for v in views]
+    to_approve = set(ask_approve(choices) or [])
+    rest = [c for c in choices if c[1] not in to_approve]
+    to_skip = set(ask_skip(rest) or []) if rest else set()
+    leave = [cid for _, cid in rest if cid not in to_skip]
+    if not to_approve and not to_skip:
+        print("Nothing selected — no changes.")
+        return ""
+    ordered = [cid for _, cid in choices]
+    parts = [f"{verb} {', '.join(str(i) for i in ordered if i in ids)}"
+             for verb, ids in (("approve", to_approve), ("skip", to_skip), ("leave", set(leave))) if ids]
+    summary = " · ".join(parts)
+    for v in views:
+        if v.row.id in to_approve:
+            print(f"  approve {v.describe()}")
+        elif v.row.id in to_skip:
+            print(f"  skip    {label(v).strip()}")
+    if not confirm(summary):
+        print("Cancelled — no changes.")
+        return summary
+    for line in approve_views(conn, [v for v in views if v.row.id in to_approve], note):
+        print(line)
+    if to_skip:
+        print(f"Skipped {skip_rows(conn, sorted(to_skip))} row(s).")
+    return summary
+
+
+def _interactive_review(conn: psycopg.Connection, yes: bool, note: str | None) -> None:
+    if not sys.stdin.isatty():
+        raise SystemExit("No terminal for the checklist — give --id / --date instead.")
+    import questionary  # only the interactive path needs it
+
+    def ask(question: str):
+        def _ask(choices):
+            if not choices:
+                return []
+            picked = questionary.checkbox(
+                question, choices=[questionary.Choice(title=text, value=cid) for text, cid in choices],
+                instruction="(space = tick, a = all, enter = done)",
+            ).ask()
+            if picked is None:  # Ctrl+C / Esc
+                raise SystemExit("Cancelled — no changes.")
+            return picked
+        return _ask
+
+    def confirm(summary: str) -> bool:
+        print(f"\n{summary}")
+        return yes or bool(questionary.confirm("Apply this?", default=False).ask())
+
+    review(conn, ask("Approve which rows?"), ask("Cancel (skip) any of the rest? (enter = leave them)"),
+           confirm, note=note)
+
+
 def _confirmed(yes_flag: bool) -> bool:
     if yes_flag:
         return True
@@ -119,6 +237,9 @@ def main() -> None:
             _print_list(conn, args.all)
             return
         ids = list(args.id) + (ids_for_date(conn, args.date) if args.date else [])
+        if not ids and args.cmd == "approve" and not args.id and not args.date:
+            _interactive_review(conn, args.yes, args.note)
+            return
         if not ids:
             raise SystemExit("Give --id and/or --date.")
         if args.cmd == "approve":
