@@ -35,10 +35,12 @@ real migrations — see that plan's "Out of scope" section; not covered
 here on purpose.
 """
 import contextlib
+import json
 import os
 import pathlib
 import sys
 from datetime import date, timedelta
+from decimal import Decimal
 
 import psycopg
 
@@ -629,6 +631,37 @@ def test_coach_tables_are_self_describing() -> None:
     print("test_coach_tables_are_self_describing: PASS")
 
 
+SAMPLE_EXERCISE_SETS = {"activityId": 1, "exerciseSets": [
+    {"setType": "ACTIVE", "repetitionCount": 5, "weight": 12500.0, "duration": 42.7, "startTime": "2026-10-01T18:56:17.0",
+     "exercises": [{"category": "UNKNOWN", "name": None, "probability": 0.0},
+                   {"category": "BENCH_PRESS", "name": "DUMBBELL_BENCH_PRESS", "probability": 99.6}]},
+    {"setType": "REST", "repetitionCount": None, "weight": None, "duration": 120.0, "startTime": "2026-10-01T18:57:00.0",
+     "exercises": []},
+]}
+
+
+def test_strength_schema_and_view() -> None:
+    coach_url, _sched_url = _setup_coach_loop()
+    with psycopg.connect(DB_URL) as conn:
+        for t in ("exercise_catalog", "activity_exercise_sets"):
+            assert _table_exists(conn, t), t
+        conn.execute("insert into activity_exercise_sets (activity_id, raw) values (1, %s), (2, %s)",
+                     (json.dumps(SAMPLE_EXERCISE_SETS), json.dumps({"activityId": 2, "exerciseSets": None})))
+        conn.commit()
+        for t in ("exercise_catalog", "activity_exercise_sets", "activity_exercise_set_rows"):
+            desc = conn.execute("select obj_description(%s::regclass, 'pg_class')", (t,)).fetchone()[0] or ""
+            assert "READ-ONLY" in desc, t
+    with psycopg.connect(coach_url) as conn:  # views need their own grant (pg_tables excludes them)
+        rows = conn.execute(
+            "select set_index, set_type, reps, weight_kg, duration_s, category, exercise, probability "
+            "from activity_exercise_set_rows order by activity_id, set_index").fetchall()
+    assert rows == [
+        (0, "ACTIVE", 5, Decimal("12.5"), Decimal("42.7"), "BENCH_PRESS", "DUMBBELL_BENCH_PRESS", Decimal("99.6")),
+        (1, "REST", None, None, Decimal("120.0"), None, None, None),
+    ], rows
+    print("test_strength_schema_and_view: PASS")
+
+
 def main() -> None:
     test_fresh_install_defaults()
     test_existing_install_adoption()
@@ -645,6 +678,7 @@ def main() -> None:
     test_review_fixes()
     test_read_only_install_has_no_coach_config()
     test_coach_tables_are_self_describing()
+    test_strength_schema_and_view()
     test_targeted_backfill_trigger_stub()
     print("\nAll smoke tests passed.")
 

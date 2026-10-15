@@ -536,7 +536,7 @@ DOMAINS: list[Domain] = [
         key="workouts", category="Workouts", label="Workout library & calendar",
         description="Your workout library (fully expanded steps + description) and workouts scheduled on your Garmin calendar. Read-only.",
         default_enabled=False, sync_incremental=_workouts_sync, backfill=None,
-        tables=("workouts", "scheduled_workouts"),
+        tables=("workouts", "scheduled_workouts", "exercise_catalog", "activity_exercise_sets"),
     ),
     # "reproductive" (menstrual calendar, pregnancy summary) is deliberately
     # not registered here yet — its endpoints haven't been verified live.
