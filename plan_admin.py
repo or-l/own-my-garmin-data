@@ -13,7 +13,9 @@ can't write that table.
 
     uv run plan_admin.py list [--all]            # upcoming rows + approval state
     uv run plan_admin.py approve                 # checklists: tick rows to approve,
-                                                 # then (optionally) rows to skip
+                                                 # then (optionally) rows to skip,
+                                                 # then offers to publish to Garmin
+    uv run plan_admin.py publish                 # upload + schedule approved rows
     uv run plan_admin.py approve --id 12 --id 13 [--note "..."] [--yes]
     uv run plan_admin.py approve --date 2026-10-02
     uv run plan_admin.py unapprove --id 12       # alias: reject
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import subprocess
 import sys
 from datetime import date
 
@@ -165,6 +168,32 @@ def review(conn: psycopg.Connection, ask_approve, ask_skip, confirm, *, today: d
     return summary
 
 
+ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def publish(run=subprocess.run) -> int:
+    """Upload, then schedule, approved rows: runs seed_workouts.py and
+    sync_schedule.py as they'd run by hand (scheduler login from .env).
+    Neither gets --confirm, so each prints its dry-run plan and asks before
+    writing to Garmin. Stops if the upload step fails."""
+    if not os.environ.get("SCHEDULER_DATABASE_URL"):
+        print("SCHEDULER_DATABASE_URL isn't set (.env) — run `uv run install.py --coach-loop` first.")
+        return 1
+    for script in ("seed_workouts.py", "sync_schedule.py"):
+        print(f"\n— {script} —", flush=True)
+        code = run(["uv", "run", str(ROOT / script)], cwd=ROOT).returncode
+        if code != 0:
+            print(f"{script} exited with {code}; stopping.")
+            return code
+    return 0
+
+
+def _offer_publish() -> None:
+    import questionary
+    if questionary.confirm("Publish approved rows to Garmin now? (you'll confirm each step)", default=True).ask():
+        publish()
+
+
 def _interactive_review(conn: psycopg.Connection, yes: bool, note: str | None) -> None:
     if not sys.stdin.isatty():
         raise SystemExit("No terminal for the checklist — give --id / --date instead.")
@@ -189,6 +218,9 @@ def _interactive_review(conn: psycopg.Connection, yes: bool, note: str | None) -
 
     review(conn, ask("Approve which rows?"), ask("Cancel (skip) any of the rest? (enter = leave them)"),
            confirm, note=note)
+    # Offered even when nothing new was approved: rows approved earlier may
+    # still be waiting to be uploaded/scheduled.
+    _offer_publish()
 
 
 def _confirmed(yes_flag: bool) -> bool:
@@ -222,6 +254,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_list = sub.add_parser("list")
     p_list.add_argument("--all", action="store_true", help="Include past rows.")
+    sub.add_parser("publish", help="Upload + schedule approved rows (each step shows its plan and asks).")
     for name in ("approve", "unapprove", "reject"):
         p = sub.add_parser(name)
         p.add_argument("--id", type=int, action="append", default=[])
@@ -232,6 +265,8 @@ def main() -> None:
     args = parser.parse_args()
 
     load_dotenv()
+    if args.cmd == "publish":
+        sys.exit(publish())
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         if args.cmd == "list":
             _print_list(conn, args.all)

@@ -252,6 +252,9 @@ Strength sessions: don't reuse a library workout unless it genuinely matches. Ge
    `uv run plan_admin.py approve` — two checklists: tick the rows to
    approve, then (optionally) the rows to cancel (`skip`); anything unticked
    is left as it is, and nothing is written until you confirm the summary.
+   It then offers to **publish** (steps 4–5 below, each showing its plan and
+   asking first); `uv run plan_admin.py publish` does the same on its own.
+   Approving alone puts nothing on Garmin.
    For scripts: `approve --id N` / `--date YYYY-MM-DD` (asks you to type
    `yes`, or pass `--yes`). Either way, an edit made after you saw a row
    shows up as STALE.
