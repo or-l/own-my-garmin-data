@@ -42,3 +42,33 @@ def test_labels_are_short_and_readable():
     assert "STALE" in hang and "10s on / 180s off ×5" in hang
     lib = plan_admin.label(_view(4, TODAY, source="library", workout_id=1231158443, library_name="Bear Essentials"))
     assert "Bear Essentials (library)" in lib
+
+
+class _Runner:
+    def __init__(self, codes):
+        self.codes, self.calls = list(codes), []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        return type("R", (), {"returncode": self.codes.pop(0)})()
+
+
+def test_publish_runs_seed_then_enact(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_DATABASE_URL", "postgresql://scheduler@x/db")
+    run = _Runner([0, 0])
+    assert plan_admin.publish(run=run) == 0
+    assert [c[-1].rsplit("/", 1)[-1] for c in run.calls] == ["seed_workouts.py", "sync_schedule.py"]
+    assert all(c[:2] == ["uv", "run"] and "--confirm" not in c for c in run.calls), "each script must show its dry run and ask"
+
+
+def test_publish_stops_if_seed_fails(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_DATABASE_URL", "postgresql://scheduler@x/db")
+    run = _Runner([1])
+    assert plan_admin.publish(run=run) == 1
+    assert len(run.calls) == 1, "don't schedule after a failed upload"
+
+
+def test_publish_needs_the_scheduler_login(monkeypatch):
+    monkeypatch.delenv("SCHEDULER_DATABASE_URL", raising=False)
+    run = _Runner([])
+    assert plan_admin.publish(run=run) == 1 and run.calls == []
